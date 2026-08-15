@@ -4,7 +4,7 @@
 
 ## 分支约定
 
-- **`main`** —— 稳定成品分支。当前可用版本 `v0.2.0` 即在此。
+- **`main`** —— 稳定成品分支。当前可用版本 `v0.3.0` 即在此。
 - 新功能：`git checkout -b feature/<名称>` → 完成并 `npm run typecheck && npm test` → 合并回 `main`。
 - 修复：`git checkout -b fix/<名称>`，同上。
 - 职责清晰：`main` 始终可运行可发布；`feature/*`/`fix/*` 是未定稿工作。
@@ -16,11 +16,11 @@
 ```bash
 git tag -a v0.3.0 -m "release notes…"
 git tag -l            # 查看
-git show v0.2.0       # 查看某版
-git checkout v0.2.0   # 回到某版看代码（记得再切回 main）
+git show v0.3.0       # 查看某版
+git checkout v0.3.0   # 回到某版看代码（记得再切回 main）
 ```
 
-当前已打：`v0.2.0`。
+当前已打：`v0.3.0`。
 
 ## 每次改完必做
 
@@ -60,6 +60,17 @@ git push origin --tags
 3. 想让社区在 DSH 里更好发现，可在仓库主页的 **Topics** 加：`dsh-plugin`、`deepseek-harness`、`agent-harness`、`web`；并写 release notes（含安装命令）。
 
 > 提示：不要在聊天/issue 里贴 token，用完即吊销、改用最小权限的 token。
+
+## 发布到 npm（可选，安装最顺）
+
+```bash
+npm login                 # 用你的 npm 账号
+npm run build && npm test # prepublishOnly 也会跑这两步
+npm publish               # 发布当前 version
+git tag -a v0.3.0 -m "..." && git push origin --tags
+```
+
+发布后用户一行安装：`dsh plugin --profile web add dsh-webui-market-plugin-plus`（若你改名/加 scope，命令里的包名同步改）。
 
 ## 安装到 dsh web profile
 

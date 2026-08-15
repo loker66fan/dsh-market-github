@@ -1,7 +1,7 @@
 {
   "name": "dsh-webui-market-plugin-plus",
-  "description": "In-harness community plugin market for the dsh web GUI — fork of @sanqi-normal/dsh-webui-market-plugin. Browse awesome-dsh-plugin.com, install/uninstall with a global never-lost progress indicator (Google-Play style), terminate installs, and enable/disable installed plugins.",
-  "version": "0.2.0",
+  "description": "In-harness plugin market for the dsh web GUI — fork of @sanqi-normal/dsh-webui-market-plugin. Startup-page onboarding entry, real-time GitHub topic:dsh-plugin search with pagination, one-click install with never-lost progress, trial-boot verification, enable/disable, and one-click restart.",
+  "version": "0.3.0",
   "type": "module",
   "author": {
     "name": "Sanqi-normal (original author), forked by condaThinker",
@@ -24,7 +24,6 @@
   },
   "files": [
     "lib/",
-    "data/",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -35,7 +34,8 @@
     "plugin",
     "market",
     "web",
-    "ui"
+    "ui",
+    "dsh-plugin"
   ],
   "license": "MIT",
   "engines": {
@@ -45,7 +45,7 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "node --test tests/*.test.mjs",
-    "snapshot": "node scripts/snapshot.mjs"
+    "prepublishOnly": "npm run build && npm test"
   },
   "dsh": {
     "bundle": {
