@@ -18,7 +18,7 @@ An in-harness plugin market for the dsh web GUI: **startup-page onboarding entry
 
 ## 功能 Features
 
-- **启动页入口**：首次运行（尚无会话）时，onboarding 引导多出「插件商城」步骤；也可随时从 设置 → 插件 → 插件市场 打开。
+- **启动页入口**：首次运行（尚无会话）时，onboarding 引导多出「插件商城」步骤（**只出现一次**——完成/跳过即被记住，之后刷新或重启不再弹）；也可随时从 设置 → 插件 → 插件市场 打开。
 - **GitHub 实时搜索**：host 端代理 `api.github.com/search/repositories`，搜索框防抖 350ms 实时请求，每页 50 条 + 上一页/下一页翻页；自动过滤 fork、归档、私有仓库。空查询返回最热插件，支持按 Star / 最近更新排序；卡片显示 topics、语言、许可证、更新时间；搜索配额（GH remaining/limit）可见，配 `GITHUB_TOKEN` 可提高。
 - **一键安装**：安装/更新/卸载走后台任务，全应用右下角进度浮条常驻（切页面不丢），可终止、可最小化；**已发布 npm 的插件优先走 registry tarball 安装（registry 校验与仓库一致防抢注，否则回退 GitHub 源）**；纯 host 插件装好后**热挂载免重启**（校验 fiber 真实激活才报成功）。
 - **可靠网络**：**自动识别设备代理**（环境变量 → 系统代理 → Clash/mihomo/v2rayN 常见端口探测），无需手动配置；GitHub 源走 **codeload tarball 直链**（绕开易卡的 git 协议）；清单校验在 raw.githubusercontent 被封时自动回退 GitHub contents API / jsDelivr / ghproxy。
@@ -57,7 +57,7 @@ dsh web
 
 ## 使用 Usage
 
-- **启动页**：首次运行（无会话）时引导里会出现「插件商城」步骤，可「完成 / 跳过」。
+- **启动页**：首次运行（无会话）时引导里会出现「插件商城」步骤，可「完成 / 跳过」；该步骤只展示一次（localStorage 记忆），之后的启动不再打扰。
 - **设置 → 插件 → 插件市场**：随时打开同一面板。
 
 搜索框实时搜索 GitHub `topic:dsh-plugin`；每页 50 条，底部「上一页 / 下一页」翻页；每个卡片显示 Star、作者、描述，支持安装 / 卸载 / 更新 / 启用 / 停用。安装中右下角进度浮条常驻，可终止；需要重启时横幅提供「立即重启」。
@@ -90,7 +90,7 @@ npm run build      # 生成 lib/host.js + lib/client.js（提交进仓库）
 npm test           # node --test tests/*.test.mjs
 ```
 
-发布前自动跑 `npm run build && npm test`（`prepublishOnly`）。版本/分支约定见 [docs/MAINTAINING.md](docs/MAINTAINING.md)。
+推送触发 GitHub Actions CI（Node 22/24 矩阵：typecheck + build + test，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)）。发布前自动跑 `npm run build && npm test`（`prepublishOnly`）。版本/分支约定见 [docs/MAINTAINING.md](docs/MAINTAINING.md)。
 
 ## 致谢 Credits
 

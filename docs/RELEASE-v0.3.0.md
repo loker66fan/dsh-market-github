@@ -23,7 +23,7 @@ dsh web
 
 ## 新特性 What's new
 
-- **启动页入口 Startup entry**：首次运行（无会话）的 onboarding 引导新增「插件商城」步骤（精简模式，可完成/跳过）；设置 → 插件 → 插件市场 随时可开。
+- **启动页入口 Startup entry**：首次运行（无会话）的 onboarding 引导新增「插件商城」步骤（精简模式，可完成/跳过；**只出现一次**——完成/跳过即被 localStorage 记住，刷新/重启不再弹）；设置 → 插件 → 插件市场 随时可开。
 - **GitHub 实时搜索 Real-time search**：host 代理 GitHub 搜索 API，防抖 350ms，每页 50 条（`config.perPage` 可调）+ 上一页/下一页；过滤 fork/归档/私有仓库；空查询返回最热插件，支持 Star/最近更新排序；卡片显示 topics、语言、许可证、更新时间；搜索配额（GH remaining/limit）在 UI 可见，配 `GITHUB_TOKEN` 可提高。
 - **可靠安装 Reliable installs**：
   - **设备代理自动识别**——按 环境变量 → 系统代理（macOS `scutil`/Windows 注册表/GNOME `gsettings`）→ 本机代理端口探测（Clash/mihomo/v2rayN 常见端口）顺序探测，自动注入安装子进程，无需手动配代理；UI 环境栏显示探测结果。
