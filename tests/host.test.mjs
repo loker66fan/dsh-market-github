@@ -9,6 +9,23 @@ import { spawn } from 'node:child_process'
 const mod = await import('../lib/host.js')
 
 let handler = null
+// Fake tool registry: collects register() calls so the market_* tool shapes
+// (DSL-compiled parameters, output schema subset) can be asserted offline.
+const registeredTools = new Map()
+// Fake jobs registry: records start() specs WITHOUT invoking run(), so a
+// background install asserts its job start fully offline.
+const jobStarts = []
+const fakeTools = {
+  register(def) { registeredTools.set(def.name, def); return () => registeredTools.delete(def.name) },
+}
+const fakeJobs = {
+  start(spec) {
+    jobStarts.push(spec)
+    return 'market-' + jobStarts.length
+  },
+}
+let toolsAvailable = true
+let jobsAvailable = true
 const ctx = {
   get(name) {
     if (name === 'webServer') {
@@ -16,6 +33,8 @@ const ctx = {
         register(route) { handler = route.handler },
       }
     }
+    if (name === 'tools' && toolsAvailable) return fakeTools
+    if (name === 'jobs' && jobsAvailable) return fakeJobs
     return undefined
   },
 }
@@ -438,6 +457,130 @@ check('checkSelfUpdate returns market update shape', self.name === 'dsh-market-g
 if (instOrigHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = instOrigHome
 try { rmSync(instHome, { recursive: true, force: true }) } catch {}
+
+// --- model tools: registered shapes, DSL-compiled parameters, background jobs ---
+// registerMarketTools ran during apply() with both services present, so all
+// four market_* tools must be in the fake registry.
+check('all four market tools registered',
+  ['market_search', 'market_install', 'market_installed', 'market_update']
+    .every((n) => registeredTools.has(n)), [...registeredTools.keys()])
+
+// Parameters are compiled from the ParameterSchemaSpec DSL shape into the raw
+// JSON Schema subset the host registry / LLM wire expects: an object root with
+// per-property nodes and a `required` array — never the DSL map itself (the
+// registry passes `parameters` through verbatim to the provider).
+const ms = registeredTools.get('market_search')
+check('market_search parameters are JSON Schema object root',
+  ms.parameters.type === 'object' && ms.parameters.properties && ms.parameters.properties.q
+  && ms.parameters.properties.q.type === 'string' && !ms.parameters.required, ms.parameters)
+check('market_search page/perPage are numbers',
+  ms.parameters.properties.page.type === 'number' && ms.parameters.properties.perPage.type === 'number', ms.parameters)
+
+const mi = registeredTools.get('market_install')
+check('market_install parameters mark spec required',
+  mi.parameters.type === 'object' && mi.parameters.properties.spec.type === 'string'
+  && Array.isArray(mi.parameters.required) && mi.parameters.required.includes('spec'), mi.parameters)
+
+const mu = registeredTools.get('market_update')
+check('market_update parameters mark name required',
+  mu.parameters.type === 'object' && mu.parameters.properties.name.type === 'string'
+  && Array.isArray(mu.parameters.required) && mu.parameters.required.includes('name'), mu.parameters)
+
+const minst = registeredTools.get('market_installed')
+check('market_installed parameters are empty object schema',
+  minst.parameters.type === 'object' && Object.keys(minst.parameters.properties).length === 0
+  && !minst.parameters.required, minst.parameters)
+
+// Output schemas stay inside the host's supported JSON Schema subset and the
+// background-capable tools declare the background/completed oneOf union.
+check('market_install output declares background oneOf branch',
+  Array.isArray(mi.output.schema.oneOf)
+  && mi.output.schema.oneOf.some((b) => b.properties.kind && b.properties.kind.const === 'background'
+    && b.required.includes('kind') && b.required.includes('jobId'))
+  && mi.output.schema.oneOf.some((b) => b.properties.ok && b.properties.needsRestart), mi.output.schema.oneOf)
+check('market_update output declares background oneOf branch',
+  Array.isArray(mu.output.schema.oneOf)
+  && mu.output.schema.oneOf.some((b) => b.properties.kind && b.properties.kind.const === 'background'), mu.output.schema.oneOf)
+
+// compileParameterSpec unit: DSL in, supported subset out (enum + required +
+// description annotations; non-object defs skipped).
+if (mod.compileParameterSpec) {
+  const compiled = mod.compileParameterSpec({
+    a: { type: 'string', required: true, description: 'needed' },
+    b: { type: 'number' },
+    c: { type: 'string', enum: ['x', 'y'] },
+  })
+  check('compileParameterSpec compiles DSL to subset schema',
+    compiled.type === 'object'
+    && compiled.properties.a.type === 'string' && compiled.properties.a.description === 'needed'
+    && compiled.properties.b.type === 'number'
+    && JSON.stringify(compiled.properties.c.enum) === JSON.stringify(['x', 'y'])
+    && JSON.stringify(compiled.required) === JSON.stringify(['a']), compiled)
+  const empty = mod.compileParameterSpec({})
+  check('compileParameterSpec empty map stays open object', empty.type === 'object'
+    && Object.keys(empty.properties).length === 0 && empty.required === undefined, empty)
+} else {
+  check('compileParameterSpec test hook exposed', false, 'no export')
+}
+
+// --- market_install execute: background handle when jobs exist (offline) ---
+// A registry spec ('@some/pkg') passes resolveInstallSpec through with no
+// network; the fake jobs.start records the spec without invoking run(), so no
+// CLI child is spawned. DSH_BIN is pinned above (process.execPath), and the
+// market bin comes from dshBin() — the auto-detect may fail under the test
+// cwd, so point the tool at the pinned env the way the probe route does.
+const toolExec = { signal: new AbortController().signal, agent: undefined }
+jobStarts.length = 0
+let bgResult = null
+try {
+  bgResult = await mi.execute({ spec: '@some/pkg' }, toolExec)
+} catch (e) {
+  check('market_install background execute resolves', false, String(e && e.message))
+}
+if (bgResult !== null) {
+  // With the jobs service present the tool must return the background handle.
+  if (bgResult.kind === 'background') {
+    check('market_install returns background handle with jobId',
+      typeof bgResult.jobId === 'string' && bgResult.jobId.length > 0, bgResult)
+    check('market_install started one job of kind market-install',
+      jobStarts.length === 1 && jobStarts[0].kind === 'market-install' && jobStarts[0].label === '@some/pkg', jobStarts)
+    check('market_install job spec carries run hooks (not executed by fake)',
+      typeof jobStarts[0].run === 'function', jobStarts[0])
+  } else {
+    // Jobs absent at execute time (flags flipped) or the sync fallback ran —
+    // accept the sync result only when jobs were disabled.
+    check('market_install fell back to sync result shape',
+      jobsAvailable === false && bgResult.ok === true && bgResult.background === true, { jobsAvailable, bgResult })
+  }
+}
+
+// --- single-flight: a running activeOp makes the tool throw before any job ---
+// Start a real op through the route with a slow fake bin, then call the tool.
+writeFileSync(fakeBin, `setTimeout(() => {}, 60000)\n`)
+const slowOp = await call({ method: 'install', source: 'fake:slow-tool', profile: 'web', binPath: fakeBin, label: 'slow-tool', skipCheck: true })
+check('slow op starts for single-flight test', slowOp.ok === true && slowOp.opId, slowOp)
+jobStarts.length = 0
+let busyError = null
+try {
+  await mi.execute({ spec: '@other/pkg' }, toolExec)
+} catch (e) {
+  busyError = e
+}
+check('market_install refuses while an op is running', busyError !== null && /已有任务进行中/.test(String(busyError && busyError.message)), String(busyError && busyError.message))
+check('no job started while busy', jobStarts.length === 0, jobStarts)
+await call({ method: 'kill' })
+await new Promise((r) => setTimeout(r, 300))
+
+// market_update: not-installed name refused before any job/CLI work.
+jobStarts.length = 0
+let updErr = null
+try {
+  await mu.execute({ name: 'definitely-not-installed' }, toolExec)
+} catch (e) {
+  updErr = e
+}
+check('market_update refuses unknown plugin', updErr !== null && /未安装/.test(String(updErr && updErr.message)), String(updErr && updErr.message))
+check('no job started for unknown plugin', jobStarts.length === 0, jobStarts)
 
 const tail = skipped > 0 ? ' (' + skipped + ' skipped)' : ''
 console.log(failures === 0 ? 'ALL PASS' + tail : failures + ' FAILURES' + tail)

@@ -323,11 +323,13 @@ function appendOutput(op: any, text: string): void {
   op.output = (op.output + String(text)).slice(-MAX_OUTPUT)
 }
 
-/** Settle an op to a terminal status and drop its pending timeout timer. */
+/** Settle an op to a terminal status, drop its pending timeout timer, and
+ * release everyone awaiting the op's `settled` promise. */
 function settleOp(op: any, status: string, exitCode?: number): void {
   clearTimeout(op.timer)
   op.status = status
   if (exitCode !== undefined) op.exitCode = exitCode
+  if (typeof op.settleResolve === 'function') op.settleResolve({ status: op.status, exitCode: op.exitCode ?? null })
 }
 
 interface Op {
@@ -345,6 +347,9 @@ interface Op {
   beforeDeps: Record<string, any>
   child?: any
   timer?: any
+  /** Resolves once the op reaches any terminal status (job `done` awaits it). */
+  settled: Promise<{ status: string; exitCode: number | null }>
+  settleResolve: (v: { status: string; exitCode: number | null }) => void
 }
 
 /** Start one install/uninstall/update as a background op. */
@@ -352,6 +357,8 @@ function startOp(kind: string, profile: string, target: string, label: string, e
   const inv = dshInvoke(explicitBin)
   if (!inv) return { ok: false, error: 'dsh CLI 未定位（可在面板填写路径）' }
   const bin = inv.args[inv.args.length - 1]
+  let settleResolve!: (v: { status: string; exitCode: number | null }) => void
+  const settled = new Promise<{ status: string; exitCode: number | null }>((resolve) => { settleResolve = resolve })
   const op: Op = {
     id: 'op-' + (++opCounter),
     kind, profile, target, label,
@@ -362,6 +369,8 @@ function startOp(kind: string, profile: string, target: string, label: string, e
     bin,
     hot: false,
     beforeDeps: readProfileDeps(profile),
+    settled,
+    settleResolve,
   }
   const cwd = inv.cwd ?? profileDir(profile)
   const child = spawn(inv.file, [...inv.args, 'plugin', '--profile', profile, kind === 'uninstall' ? 'remove' : 'add', target], {
@@ -1401,6 +1410,37 @@ async function checkSelfUpdate(profile: string): Promise<{ name: string; version
 /** The profile the model tools operate on (mirrors the web UI default). */
 const TOOL_PROFILE = 'web'
 
+/**
+ * Compile one ParameterSchemaSpec-shaped parameter map (the host ecosystem's
+ * authoring DSL: `{ q: { type:'string', required:true, description } }`) into
+ * the raw JSON Schema subset the host tool registry / LLM wire expects
+ * (`{ type:'object', properties:{ q:{type:'string',...} }, required:['q'] }`).
+ *
+ * This plugin stays a raw `ctx.tools.register` ToolDefinition contributor (the
+ * @deepseek-ai/dsh-tools peer is not a devDependency, so `defineTool` cannot be
+ * imported at build time); raw registrations own their input validation, which
+ * is why every execute() below still hand-checks its args. Compiling the DSL
+ * locally keeps the model-facing projection byte-identical to what a
+ * defineTool-wrapped first-party tool would project, instead of shipping the
+ * DSL shape itself to the provider wire (the registry passes `parameters`
+ * through verbatim — it never recompiles).
+ */
+function compileParameterSpec(spec: Record<string, any>): Record<string, any> {
+  const properties: Record<string, any> = {}
+  const required: string[] = []
+  for (const [key, def] of Object.entries(spec || {})) {
+    if (!def || typeof def !== 'object') continue
+    const node: Record<string, any> = { type: def.type }
+    if (typeof def.description === 'string' && def.description !== '') node.description = def.description
+    if (Array.isArray(def.enum) && def.enum.length > 0) node.enum = [...def.enum]
+    properties[key] = node
+    if (def.required === true) required.push(key)
+  }
+  const schema: Record<string, any> = { type: 'object', properties }
+  if (required.length > 0) schema.required = required
+  return schema
+}
+
 /** Run one dsh CLI invocation synchronously and return the captured result. */
 function runCliSync(args: string[], timeoutMs: number): Promise<any> {
   const inv = dshInvoke()
@@ -1412,6 +1452,53 @@ function runCliSync(args: string[], timeoutMs: number): Promise<any> {
   })
 }
 
+/**
+ * Start one background op as a ctx.jobs job and return its handle. Reuses the
+ * startOp infrastructure (output collection, hard timeout, hot-mount on
+ * success) so a tool-initiated install and a UI-initiated one are the SAME
+ * single-flight pipeline: activeOp mutual exclusion applies to both, and the
+ * UI progress pill shows the tool job too. The JobHooks wrap the op: cancel()
+ * routes to killOp(), done resolves through op.settled into a JobOutcome, and
+ * readOutput() tails the op's collected output as a consuming cursor.
+ *
+ * A refusing `begin` (startOp could not spawn: CLI missing, op busy) throws
+ * from run(), which the jobs contract treats as "nothing registered" — the
+ * error then surfaces to the model directly instead of as a dead job id.
+ */
+function startMarketJob(jobs: any, exec: any, kind: 'market-install' | 'market-update', label: string, begin: () => string): { jobId: string } | { error: string } {
+  try {
+    const jobId = jobs.start({
+      kind,
+      label,
+      ...exec && exec.agent ? { owner: exec.agent } : {},
+      run: () => {
+        begin() // throws on refusal → nothing registered
+        const op = activeOp
+        let readCursor = 0
+        return {
+          cancel: () => { killOp() },
+          done: op.settled.then((v: any) => {
+            const map: Record<string, 'completed' | 'killed' | 'failed'> = { done: 'completed', killed: 'killed', timeout: 'failed', failed: 'failed' }
+            return {
+              status: map[v.status] || ('failed' as const),
+              ...(v.exitCode !== null && v.exitCode !== undefined ? { detail: 'exit code: ' + String(v.exitCode) } : {}),
+              output: String(op.output || '').slice(-8000),
+            }
+          }),
+          readOutput: (): string => {
+            const text = String(op.output || '').slice(readCursor)
+            readCursor = String(op.output || '').length
+            return text
+          },
+        }
+      },
+    })
+    return { jobId: String(jobId) }
+  } catch (e: any) {
+    return { error: String((e && e.message) || e) }
+  }
+}
+
 /** Register the market_* tools when the tool registry service exists. */
 function registerMarketTools(ctx: any): void {
   const tools = ctx.get('tools')
@@ -1420,14 +1507,11 @@ function registerMarketTools(ctx: any): void {
   tools.register({
     name: 'market_search',
     description: 'Search the DeepSeek Harness plugin marketplace (GitHub `dsh-plugin` topic) for installable plugins. Returns a JSON list of repositories: full name, stars, language, one-line description, and URL. Supports a keyword and pagination (the topic holds 1800+ repos; page through with `page`/`perPage`). Use this before market_install to find the right repo.',
-    parameters: {
-      type: 'object',
-      properties: {
-        q: { type: 'string', description: 'Search keyword within the dsh-plugin topic (name/description/language). Empty returns the top-starred page.' },
-        page: { type: 'integer', description: 'Page number (1-based, default 1).' },
-        perPage: { type: 'integer', description: 'Results per page (max 100, default 50).' },
-      },
-    },
+    parameters: compileParameterSpec({
+      q: { type: 'string', description: 'Search keyword within the dsh-plugin topic (name/description/language). Empty returns the top-starred page.' },
+      page: { type: 'number', description: 'Page number (1-based, default 1).' },
+      perPage: { type: 'number', description: 'Results per page (max 100, default 50).' },
+    }),
     output: {
       schema: {
         type: 'object',
@@ -1476,34 +1560,71 @@ function registerMarketTools(ctx: any): void {
 
   tools.register({
     name: 'market_install',
-    description: 'Install a plugin from the DeepSeek Harness plugin marketplace into the `web` profile. Accepts a GitHub repo as `owner/repo`, a git URL, an npm package name, or a local path. Runs the same safety gate as the UI (dsh-manifest verification + throwaway trial boot), then `dsh plugin --profile web add <spec>`; returns the pnpm output and whether a harness restart is required. Verify the repo with market_search first.',
-    parameters: {
-      type: 'object',
-      properties: {
-        spec: { type: 'string', description: 'Package name, GitHub owner/repo, git URL, or local path to install.' },
-      },
-      required: ['spec'],
-    },
+    description: 'Install a plugin from the DeepSeek Harness plugin marketplace into the `web` profile. Accepts a GitHub repo as `owner/repo`, a git URL, an npm package name, or a local path. Runs the same safety gate as the UI (dsh-manifest verification + throwaway trial boot), then `dsh plugin --profile web add <spec>`. Runs as a background job when the jobs service is available: the call returns { kind: "background", jobId } immediately — collect output with job_output and stop with job_kill; the install finishes with hot-mount or a restart hint in the job output. Falls back to a synchronous result when jobs are unavailable. Verify the repo with market_search first.',
+    parameters: compileParameterSpec({
+      spec: { type: 'string', required: true, description: 'Package name, GitHub owner/repo, git URL, or local path to install.' },
+    }),
     output: {
       schema: {
-        type: 'object',
-        properties: { ok: { type: 'boolean' }, spec: { type: 'string' }, installed: { type: 'string' }, needsRestart: { type: 'boolean' }, output: { type: 'string' } },
-        additionalProperties: true,
+        oneOf: [
+          {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', const: 'background' },
+              jobId: { type: 'string' },
+            },
+            required: ['kind', 'jobId'],
+            additionalProperties: true,
+          },
+          {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, spec: { type: 'string' }, installed: { type: 'string' }, needsRestart: { type: 'boolean' }, output: { type: 'string' }, background: { type: 'boolean' } },
+            required: ['ok', 'spec', 'installed', 'needsRestart', 'output'],
+            additionalProperties: true,
+          },
+        ],
       },
       render(_args: any, value: any): any[] {
+        if (value.kind === 'background') {
+          return [{ type: 'text', text: `安装已在后台启动（job ${value.jobId}）：用 job_output ${value.jobId} 查看进度/结果，job_kill ${value.jobId} 终止。完成前不可再发起安装/更新。` }]
+        }
         return [{ type: 'text', text: value.ok
-          ? `已安装 ${value.installed}${value.needsRestart ? '（重启 harness 后生效）' : '（已热挂载，免重启）'}\n${value.output}`
+          ? `已安装 ${value.installed}${value.needsRestart ? '（重启 harness 后生效）' : '（已热挂载，免重启）'}${value.background ? '（同步执行：后台服务不可用）' : ''}\n${value.output}`
           : `安装失败：\n${value.output}` }]
       },
     },
-    async execute(args: any) {
+    async execute(args: any, exec: any) {
       const spec = String((args && args.spec) || '').trim()
       if (!spec) throw new Error('market_install requires a non-empty spec')
       const bin = String(dshBin() || '')
       if (!bin) throw new Error('dsh CLI 未定位（可在面板填写路径）')
+      // Single-flight invariant: the tool path and the UI share one CLI pnpm
+      // serial constraint. The UI route checks activeOp; the tool must too, or
+      // a model-initiated install could race a user-initiated one.
+      if (activeOp && activeOp.status === 'running') {
+        throw new Error('已有任务进行中：' + activeOp.label + '（等待完成后再试）')
+      }
       const before = readProfileDeps(TOOL_PROFILE)
       const resolved = await resolveInstallSpec(spec, bin, TOOL_PROFILE)
       if (!resolved.ok) throw new Error(resolved.output)
+      const jobs = ctx.get('jobs')
+      if (jobs !== undefined) {
+        // Re-check after the async gate: another install may have started while
+        // resolveInstallSpec was probing.
+        if (activeOp && activeOp.status === 'running') {
+          throw new Error('已有任务进行中：' + activeOp.label + '（等待完成后再试）')
+        }
+        await waitProxyReady(2000)
+        const started = startMarketJob(jobs, exec, 'market-install', spec, () => {
+          const r = startOp('install', TOOL_PROFILE, resolved.installSpec, spec, bin,
+            'market_install: ' + spec + ' → ' + resolved.installSpec + '\n')
+          if (!r.ok || !r.opId) throw new Error(r.error || '未能启动安装任务')
+          return r.opId
+        })
+        if ('jobId' in started) return { kind: 'background' as const, jobId: started.jobId }
+        throw new Error(started.error)
+      }
+      // Synchronous fallback (jobs service unavailable, e.g. headless profile).
       const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', resolved.installSpec], PROBE_INSTALL_TIMEOUT)
       if (!result.ok) {
         throw new Error('安装失败（exit ' + String(result.code ?? '?') + '）：\n' + String(result.output || '').slice(-4000))
@@ -1515,20 +1636,20 @@ function registerMarketTools(ctx: any): void {
           needsRestart = !hot.hot
         } catch { needsRestart = true }
       }
-      return { ok: true, spec, installed: resolved.installSpec, needsRestart, output: String(result.output || '').slice(-4000) }
+      return { ok: true, spec, installed: resolved.installSpec, needsRestart, output: String(result.output || '').slice(-4000), background: true }
     },
   })
 
   tools.register({
     name: 'market_installed',
     description: 'List the plugins in the `web` profile with their versions and update availability. Returns `plugins` (each with `name`, `kind` = `builtin` or `installed`, `enabled`, `version`, `latestVersion`, `updateAvailable`) and `self` when this marketplace itself can be updated. Use this before market_update to find names.',
-    parameters: { type: 'object', properties: {} },
+    parameters: compileParameterSpec({}),
     output: {
       schema: {
         type: 'object',
         properties: {
           plugins: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string' }, enabled: { type: 'boolean' }, version: { type: 'string' }, latestVersion: { type: 'string' }, updateAvailable: { type: 'boolean' } }, additionalProperties: true } },
-          self: { type: 'object', properties: { name: { type: 'string' }, version: { type: 'string' }, latestVersion: { type: 'string' } }, additionalProperties: true },
+          self: { oneOf: [{ type: 'object', properties: { name: { type: 'string' }, version: { type: 'string' }, latestVersion: { type: 'string' } }, additionalProperties: true }, { type: 'null' }] },
           restartHint: { type: 'string' },
         },
         additionalProperties: true,
@@ -1557,32 +1678,45 @@ function registerMarketTools(ctx: any): void {
           updateAvailable: r.updateAvailable,
         })),
         self: self.updateAvailable ? { name: self.name, version: self.version, latestVersion: self.latestVersion } : null,
-        restartHint: 'install/update/enable/disable 后通常需要重启 harness 才能生效',
+        restartHint: 'install/update/enable/disable 后通常需要重启 harness 才能生效；market_install/market_update 在后台服务可用时以后台 job 运行，用 job_output 收集其输出、job_kill 终止',
       }
     },
   })
 
   tools.register({
     name: 'market_update',
-    description: 'Update one installed plugin in the `web` profile to its latest version (a harness restart is required to take effect). Accepts the package `name` exactly as reported by market_installed.',
-    parameters: {
-      type: 'object',
-      properties: {
-        name: { type: 'string', description: 'Package name of the installed plugin to update (from market_installed).' },
-      },
-      required: ['name'],
-    },
+    description: 'Update one installed plugin in the `web` profile to its latest version (a harness restart is required to take effect). Runs as a background job when the jobs service is available: the call returns { kind: "background", jobId } immediately — collect output with job_output and stop with job_kill. Falls back to a synchronous result when jobs are unavailable. Accepts the package `name` exactly as reported by market_installed.',
+    parameters: compileParameterSpec({
+      name: { type: 'string', required: true, description: 'Package name of the installed plugin to update (from market_installed).' },
+    }),
     output: {
       schema: {
-        type: 'object',
-        properties: { ok: { type: 'boolean' }, name: { type: 'string' }, target: { type: 'string' }, needsRestart: { type: 'boolean' }, output: { type: 'string' } },
-        additionalProperties: true,
+        oneOf: [
+          {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', const: 'background' },
+              jobId: { type: 'string' },
+            },
+            required: ['kind', 'jobId'],
+            additionalProperties: true,
+          },
+          {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, name: { type: 'string' }, target: { type: 'string' }, needsRestart: { type: 'boolean' }, output: { type: 'string' }, background: { type: 'boolean' } },
+            required: ['ok', 'name', 'target', 'needsRestart', 'output'],
+            additionalProperties: true,
+          },
+        ],
       },
       render(_args: any, value: any): any[] {
-        return [{ type: 'text', text: `已更新 ${value.name} → ${value.target}（重启 harness 后生效）\n${value.output}` }]
+        if (value.kind === 'background') {
+          return [{ type: 'text', text: `更新已在后台启动（job ${value.jobId}）：用 job_output ${value.jobId} 查看进度/结果，job_kill ${value.jobId} 终止。完成前不可再发起安装/更新。` }]
+        }
+        return [{ type: 'text', text: `已更新 ${value.name} → ${value.target}（重启 harness 后生效）${value.background ? '（同步执行：后台服务不可用）' : ''}\n${value.output}` }]
       },
     },
-    async execute(args: any) {
+    async execute(args: any, exec: any) {
       const name = String((args && args.name) || '').trim()
       if (!name) throw new Error('market_update requires a plugin name (from market_installed)')
       const deps = readProfileDeps(TOOL_PROFILE)
@@ -1595,11 +1729,27 @@ function registerMarketTools(ctx: any): void {
         : String(spec).startsWith('https://codeload.github.com/') ? String(spec).replace(/\/tar\.gz\/.+$/, '/tar.gz/HEAD')
         : `${name}@latest`
       updatesCache = { ...updatesCache, [TOOL_PROFILE]: null }
+      // Single-flight invariant shared with the UI route (one CLI pnpm serial).
+      if (activeOp && activeOp.status === 'running') {
+        throw new Error('已有任务进行中：' + activeOp.label + '（等待完成后再试）')
+      }
+      const jobs = ctx.get('jobs')
+      if (jobs !== undefined) {
+        await waitProxyReady(2000)
+        const started = startMarketJob(jobs, exec, 'market-update', name, () => {
+          const r = startOp('update', TOOL_PROFILE, target, name, '',
+            'market_update: ' + name + ' → ' + target + '\n')
+          if (!r.ok || !r.opId) throw new Error(r.error || '未能启动更新任务')
+          return r.opId
+        })
+        if ('jobId' in started) return { kind: 'background' as const, jobId: started.jobId }
+        throw new Error(started.error)
+      }
       const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', target], PROBE_INSTALL_TIMEOUT)
       if (!result.ok) {
         throw new Error('更新失败（exit ' + String(result.code ?? '?') + '）：\n' + String(result.output || '').slice(-4000))
       }
-      return { ok: true, name, target, needsRestart: true, output: String(result.output || '').slice(-4000) }
+      return { ok: true, name, target, needsRestart: true, output: String(result.output || '').slice(-4000), background: true }
     },
   })
   console.log('[dsh-market] registered model tools: market_search, market_install, market_installed, market_update')
@@ -1608,7 +1758,7 @@ function registerMarketTools(ctx: any): void {
 /** Read-only view of the updates cache for tests (the live object identity). */
 function updatesCacheView(): Record<string, any> { return updatesCache }
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView, compileParameterSpec } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
