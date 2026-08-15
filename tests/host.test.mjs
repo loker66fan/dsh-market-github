@@ -281,6 +281,20 @@ check('toggleActive rejects not-installed', missing.ok === false && /未安装/.
 const crossT = await call({ method: 'toggleActive', profile: 'web', name: 'whale-girl', enabled: true }, { origin: 'http://evil.example' })
 check('toggleActive rejected cross-origin', crossT.ok === false && /untrusted/.test(crossT.error || ''), crossT)
 
+// --- ensureAllowBuilds: idempotent per-package build consent ---
+writeFileSync(join(tprof, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n')
+mod.ensureAllowBuilds('web', '@acme/tool')
+mod.ensureAllowBuilds('web', '@acme/tool') // idempotent
+const wsText = readFileSync(join(tprof, 'pnpm-workspace.yaml'), 'utf8')
+check('ensureAllowBuilds adds key once', (wsText.match(/@acme\/tool: true/g) || []).length === 1, wsText)
+mod.ensureAllowBuilds('web', 'second-tool')
+const wsText2 = readFileSync(join(tprof, 'pnpm-workspace.yaml'), 'utf8')
+check('ensureAllowBuilds appends under existing block', (wsText2.match(/@acme\/tool: true/g) || []).length === 1
+  && (wsText2.match(/second-tool: true/g) || []).length === 1, wsText2)
+mod.ensureAllowBuilds('web', 'not a valid key!')
+const wsText3 = readFileSync(join(tprof, 'pnpm-workspace.yaml'), 'utf8')
+check('ensureAllowBuilds rejects invalid key', wsText3 === wsText2, wsText3)
+
 if (origHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = origHome
 try { rmSync(tmpHome, { recursive: true, force: true }) } catch {}

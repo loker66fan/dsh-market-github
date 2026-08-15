@@ -237,12 +237,14 @@ function startOp(kind: string, profile: string, target: string, label: string, e
     if (op.status !== 'running') return
     const ok = code === 0
     if (ok && op.kind === 'install' && hotCtx !== null) {
-      const mounted = await tryHotMountAll(hotCtx, op.profile, op.beforeDeps)
-      if (mounted) {
+      const result = await tryHotMountAll(hotCtx, op.profile, op.beforeDeps)
+      if (result.hot) {
         op.hot = true
         appendOutput(op, '\n[hot] 已热挂载（无需重启，刷新页面即可使用）\n')
+      } else if (result.reason === 'web-client-half') {
+        appendOutput(op, '\n[hot] 该插件包含 Web 客户端，前端清单在启动时已固定，重启 web 后生效（可用横幅的「立即重启」）\n')
       } else {
-        appendOutput(op, '\n[hot] 热挂载不可用（插件 patch 较复杂或环境不支持），重启 web 后生效\n')
+        appendOutput(op, '\n[hot] 热挂载不可用（插件 patch 较复杂或激活验证未通过），重启 web 后生效\n')
       }
     }
     settleOp(op, ok ? 'done' : 'failed', code)
@@ -350,7 +352,7 @@ const PROBE_BOOT_TIMEOUT = 120000
 const READY_LINE_RE = /dsh web:\s+http:\/\//
 
 /** Trial boot probe: prove the candidate boots under the web profile first. */
-async function runProbe(explicitBin: string, source: string): Promise<{ ok: true } | { ok: false; stage: 'install' | 'boot'; output: string }> {
+async function runProbe(explicitBin: string, source: string, allowBuilds?: readonly string[]): Promise<{ ok: true } | { ok: false; stage: 'install' | 'boot'; output: string }> {
   const inv = dshInvoke(explicitBin)
   if (!inv) return { ok: false, stage: 'install', output: 'dsh CLI 未定位（可在面板填写路径）' }
   const home = mkdtempSync(join(tmpdir(), 'dsh-mkts-probe-'))
@@ -364,7 +366,12 @@ async function runProbe(explicitBin: string, source: string): Promise<{ ok: true
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } },
     }, null, 2) + '\n')
     writeFileSync(join(profileDir_, 'cordis.patch.yml'), '[]\n')
-    writeFileSync(join(profileDir_, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n')
+    // Git dependencies run their prepare script at install; pnpm ≥10 blocks
+    // that until the exact package key is allowlisted. The probe is a
+    // throwaway environment, so consent to the verified package's build here.
+    const builds = Array.isArray(allowBuilds) ? allowBuilds.filter((k) => k && /^(@[a-z0-9-_.~]+\/)?[a-z0-9-_.~]+$/.test(k)) : []
+    writeFileSync(join(profileDir_, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n'
+      + (builds.length > 0 ? '\nallowBuilds:\n' + builds.map((k) => `  ${k}: true`).join('\n') + '\n' : ''))
     const env = { ...process.env, DSH_HOME: home, CI: 'true' }
     const runCwd = inv.cwd ?? profileDir_
 
@@ -421,6 +428,28 @@ function snapshotProfile(profile: string): string | null {
     writeFileSync(snap, readFileSync(p, 'utf8'))
     return snap
   } catch { return null }
+}
+
+/**
+ * Add one package key to the real profile's pnpm `allowBuilds` list
+ * (idempotent). Only called after the market verified the package's dsh
+ * manifest (and, for bundle-only plugins, a passing throwaway trial boot),
+ * so the consent is scoped to exactly that verified package.
+ */
+function ensureAllowBuilds(profile: string, key: string): void {
+  if (!key || !/^(@[a-z0-9-_.~]+\/)?[a-z0-9-_.~]+$/.test(key)) return
+  const p = join(profileDir(profile), 'pnpm-workspace.yaml')
+  if (!existsSync(p)) return
+  const text = readFileSync(p, 'utf8')
+  const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  if (new RegExp('^\\s*' + escapeRe(key) + '\\s*:\\s*true\\s*$', 'm').test(text)) return
+  const block = /^(\s*)allowBuilds\s*:.*$/m.exec(text)
+  if (block !== null) {
+    const ind = block[1] + '  '
+    writeFileSync(p, text.replace(/^(\s*)allowBuilds\s*:.*$/m, (line) => line + '\n' + ind + key + ': true'))
+  } else {
+    writeFileSync(p, text.replace(/\n+$/, '') + '\n\nallowBuilds:\n  ' + key + ': true\n')
+  }
 }
 
 // ── GitHub real-time search (topic:dsh-plugin) ───────────────────────────────
@@ -571,7 +600,27 @@ function cleanHotDir(profile: string): void {
 let hotSequence = 0
 const hotHandles = new Map<string, any>()
 
+/** Whether an installed package declares a browser client half (`dsh.client`). */
+function hasWebClient(profile: string, packageName: string): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(join(profileDir(profile), 'node_modules', packageName, 'package.json'), 'utf8'))
+    const client = manifest.dsh && manifest.dsh.client
+    return client !== undefined && client.platform === 'web'
+  } catch { return false }
+}
+
+/** FiberState.ACTIVE — Cordis's const enum value (no cross-package import here). */
+const FIBER_ACTIVE = 2
+/** FiberState.FAILED. */
+const FIBER_FAILED = 3
+
+/**
+ * Hot-mount one installed package by replaying its simple patch through a
+ * temp include file, then verify the loader entry actually reached ACTIVE.
+ * Returns true only on a verified activation — a claim the UI can trust.
+ */
 async function hotMount(ctx: any, profile: string, packageName: string): Promise<boolean> {
+  let handle: any = null
   try {
     const HotTree = await loadHotTreeClass()
     if (HotTree === null) return false
@@ -584,11 +633,27 @@ async function hotMount(ctx: any, profile: string, packageName: string): Promise
     const file = join(dir, 'hot-' + String(hotSequence) + '.yml')
     const yml = rows.map((row) => `- id: mkt-${row.id}\n  name: '${row.name}'\n`).join('')
     writeFileSync(file, yml)
-    const handle = ctx.plugin(HotTree, { path: pathToFileURL(file).href })
+    handle = ctx.plugin(HotTree, { path: pathToFileURL(file).href })
     await handle.await()
-    hotHandles.set(packageName, handle)
-    return true
+    // Verify the mounted row actually activated: a row whose inject
+    // dependencies cannot be met stays pending/failed and must never be
+    // reported as hot-mounted.
+    const loader = ctx.get('loader')
+    const deadline = Date.now() + 8000
+    while (Date.now() < deadline) {
+      const entry = loader && [...loader.entries()].find((e: any) => e.options && e.options.name === packageName)
+      const state = entry && entry.fiber ? entry.fiber.state : undefined
+      if (state === FIBER_ACTIVE) {
+        hotHandles.set(packageName, handle)
+        return true
+      }
+      if (state === FIBER_FAILED) break
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    try { await handle.dispose() } catch {}
+    return false
   } catch (e: any) {
+    if (handle !== null) { try { await handle.dispose() } catch {} }
     console.warn('[dsh-market] hot mount of ' + packageName + ' failed, restart required: ' + String((e && e.message) || e))
     return false
   }
@@ -624,14 +689,21 @@ async function disableLoaderEntry(packageName: string): Promise<void> {
   }
 }
 
-async function tryHotMountAll(ctx: any, profile: string, beforeDeps: Record<string, any>): Promise<boolean> {
+async function tryHotMountAll(ctx: any, profile: string, beforeDeps: Record<string, any>): Promise<{ hot: boolean; reason?: 'web-client-half' }> {
   try {
     const after = readProfileDeps(profile)
     const added = Object.keys(after).filter((n) => beforeDeps[n] === undefined)
-    if (added.length === 0) return false
+    if (added.length === 0) return { hot: false }
+    // A browser client half cannot hot-load: the frontend serves client
+    // bundles from the boot-time roster, so its UI appears only after a
+    // restart. Claiming "hot-mounted" here would promise an effect that
+    // never shows.
+    for (const n of added) {
+      if (hasWebClient(profile, n)) return { hot: false, reason: 'web-client-half' }
+    }
     const results = await Promise.all(added.map((n) => hotMount(ctx, profile, n)))
-    return results.every(Boolean)
-  } catch { return false }
+    return { hot: results.every(Boolean) }
+  } catch { return { hot: false } }
 }
 
 function readProfileDeps(profile: string): Record<string, any> {
@@ -803,7 +875,7 @@ async function checkUpdates(profile: string): Promise<Record<string, any>> {
 const UPDATES_TTL_MS = 10 * 60 * 1000
 let updatesCache: Record<string, any> = {}
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -943,7 +1015,11 @@ export function apply(ctx: any): void {
                 })
               }
               if (!cls.webClient) {
-                const verdict = await runProbe(bin, target)
+                // Bundle-only plugin: trial boot in a throwaway profile. The
+                // probe consents to the verified package's prepare script in
+                // its own throwaway workspace, so git installs pass pnpm's
+                // build block there.
+                const verdict = await runProbe(bin, target, cls.pkgName !== null && cls.pkgName !== undefined ? [cls.pkgName] : [])
                 if (!verdict.ok) {
                   const stage = verdict.stage === 'install'
                     ? '候选插件安装进试装环境失败'
@@ -955,11 +1031,19 @@ export function apply(ctx: any): void {
                       + '\n\n如需强制安装（风险自负），请勾选"跳过安全检查"。',
                   })
                 }
+                // Real install stays a git spec: consent the build for exactly
+                // this verified package in the real profile too.
+                if (cls.pkgName !== null && cls.pkgName !== undefined) ensureAllowBuilds(profile, cls.pkgName)
               } else {
                 // Web-client plugin: prefer a registry-verified npm tarball
-                // (seconds, no prepare script); fall back to the GitHub source.
+                // (seconds, no prepare script); fall back to the GitHub source
+                // (then consent the verified package's build).
                 const npm = await npmRegistrySpec(target, cls.pkgName ?? null)
-                if (npm !== null) installSpec = npm
+                if (npm !== null) {
+                  installSpec = npm
+                } else if (cls.pkgName !== null && cls.pkgName !== undefined) {
+                  ensureAllowBuilds(profile, cls.pkgName)
+                }
               }
             }
             const snap = snapshotProfile(profile)
