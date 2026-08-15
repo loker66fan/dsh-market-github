@@ -944,10 +944,37 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
   }
 }
 
+// Cordis FiberState is a cross-package const enum, so its values are mirrored
+// here — the same approach as the host's plugin-inventory package.
+/** FiberState.PENDING. */
+const FIBER_PENDING = 0
+/** FiberState.LOADING. */
+const FIBER_LOADING = 1
 /** FiberState.ACTIVE — Cordis's const enum value (no cross-package import here). */
 const FIBER_ACTIVE = 2
 /** FiberState.FAILED. */
 const FIBER_FAILED = 3
+/** FiberState.DISPOSED. */
+const FIBER_DISPOSED = 4
+/** FiberState.UNLOADING. */
+const FIBER_UNLOADING = 5
+
+/**
+ * Project a Cordis FiberState number onto the live phase label exposed on
+ * installed rows — the same mapping as the host's official plugin-inventory
+ * projection (pending/loading/active/failed/unloading; DISPOSED has no label
+ * because a disposed fiber is no longer in the live composition).
+ */
+function mapLivePhase(state: number | undefined | null): 'active' | 'loading' | 'pending' | 'failed' | 'unloading' | null {
+  switch (state) {
+    case FIBER_PENDING: return 'pending'
+    case FIBER_LOADING: return 'loading'
+    case FIBER_ACTIVE: return 'active'
+    case FIBER_FAILED: return 'failed'
+    case FIBER_UNLOADING: return 'unloading'
+    default: return null // DISPOSED / unknown / no fiber yet
+  }
+}
 
 /**
  * Hot-mount one installed package by replaying its simple patch through a
@@ -1021,6 +1048,34 @@ function loaderNamesFor(profile: string, packageName: string): string[] {
     if (rows !== null && rows.length > 0) return rows.map((row) => row.name)
   } catch {}
   return [packageName]
+}
+
+/**
+ * Snapshot the live loader entries as Map<moduleName, {state, disabled}>,
+ * indexed by entry.options.name. When several entries share a name (e.g. a
+ * stale duplicate plus a hot-mounted replacement), the FAILED fiber wins over
+ * any non-failed one so a broken activation is never masked by its twin.
+ * Returns null when there is no loader in this process (headless/test ctx) —
+ * every live phase then projects to null ("needs restart / not loaded here").
+ */
+function liveLoaderStates(): Map<string, { state: number | undefined; disabled: boolean }> | null {
+  let loader: any = null
+  try {
+    loader = hotCtx && hotCtx.get('loader')
+  } catch { return null }
+  if (!loader || typeof loader.entries !== 'function') return null
+  const map = new Map<string, { state: number | undefined; disabled: boolean }>()
+  try {
+    for (const entry of loader.entries()) {
+      const name = entry && entry.options && entry.options.name
+      if (typeof name !== 'string' || name === '') continue
+      const prev = map.get(name)
+      const state = entry.fiber ? entry.fiber.state : undefined
+      if (prev !== undefined && (prev.state === FIBER_FAILED || state !== FIBER_FAILED)) continue
+      map.set(name, { state, disabled: entry.disabled === true })
+    }
+  } catch { return null }
+  return map
 }
 
 async function disableLoaderEntry(names: string[]): Promise<void> {
@@ -1325,17 +1380,44 @@ interface InstalledRow {
   spec: string | null
   latestVersion: string | null
   updateAvailable: boolean
+  /**
+   * Runtime truth from the live loader fiber: pending/loading/active/failed/
+   * unloading, or null when this process holds no matching loader entry
+   * (typically "file-level change needs a restart to load", or a pure
+   * client-side plugin the host never mounts).
+   */
+  live: 'active' | 'loading' | 'pending' | 'failed' | 'unloading' | null
+}
+
+/**
+ * Live phase of the first loader entry whose module name matches the package's
+ * patch row names (entry.options.name is the row's module resolution name, not
+ * necessarily the npm package name — same matching as the hot-mount paths).
+ * Unified for builtin and installed rows: template bundles are loader entries
+ * too, so official plugins get their real runtime state shown as well.
+ */
+function livePhaseFor(live: Map<string, { state: number | undefined; disabled: boolean }> | null, profile: string, name: string): 'active' | 'loading' | 'pending' | 'failed' | 'unloading' | null {
+  if (live === null) return null
+  for (const candidate of loaderNamesFor(profile, name)) {
+    const entry = live.get(candidate)
+    if (entry !== undefined) return mapLivePhase(entry.state)
+  }
+  return null
 }
 
 /**
  * Project a profile's active layer into built-in (template bundles, read-only)
  * and user-installed (profile dependencies) plugin rows, merged with update
- * availability. The market's own package appears as an installed row.
+ * availability. The market's own package appears as an installed row. Each row
+ * also carries `live`: the real-time loader fiber phase for this process, so
+ * the UI can distinguish "serving right now" from "file-enabled but stale
+ * until restart".
  */
 async function listInstalled(profile: string): Promise<InstalledRow[]> {
   const deps = readProfileDeps(profile)
   const bundles = readProfileBundles(profile)
   const updates = await checkUpdates(profile)
+  const live = liveLoaderStates()
   const rows: InstalledRow[] = []
   for (const name of bundles) {
     if (deps[name] !== undefined) continue // user-installed: emitted below
@@ -1347,6 +1429,7 @@ async function listInstalled(profile: string): Promise<InstalledRow[]> {
       spec: null,
       latestVersion: null,
       updateAvailable: false,
+      live: livePhaseFor(live, profile, name),
     })
   }
   for (const [name, spec] of Object.entries(deps)) {
@@ -1365,6 +1448,7 @@ async function listInstalled(profile: string): Promise<InstalledRow[]> {
       spec: String(spec),
       latestVersion: up && up.latest != null ? String(up.latest) : null,
       updateAvailable: !!(up && up.updateAvailable),
+      live: livePhaseFor(live, profile, name),
     })
   }
   return rows
@@ -1642,13 +1726,13 @@ function registerMarketTools(ctx: any): void {
 
   tools.register({
     name: 'market_installed',
-    description: 'List the plugins in the `web` profile with their versions and update availability. Returns `plugins` (each with `name`, `kind` = `builtin` or `installed`, `enabled`, `version`, `latestVersion`, `updateAvailable`) and `self` when this marketplace itself can be updated. Use this before market_update to find names.',
+    description: 'List the plugins in the `web` profile with their versions, live loader state, and update availability. Returns `plugins` (each with `name`, `kind` = `builtin` or `installed`, `enabled`, `live` = `active` | `loading` | `pending` | `failed` | `unloading` | null where null means the change needs a harness restart to load, `version`, `latestVersion`, `updateAvailable`) and `self` when this marketplace itself can be updated. Use this before market_update to find names.',
     parameters: compileParameterSpec({}),
     output: {
       schema: {
         type: 'object',
         properties: {
-          plugins: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string' }, enabled: { type: 'boolean' }, version: { type: 'string' }, latestVersion: { type: 'string' }, updateAvailable: { type: 'boolean' } }, additionalProperties: true } },
+          plugins: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string' }, enabled: { type: 'boolean' }, live: { oneOf: [{ type: 'string', enum: ['active', 'loading', 'pending', 'failed', 'unloading'] }, { type: 'null' }] }, version: { type: 'string' }, latestVersion: { type: 'string' }, updateAvailable: { type: 'boolean' } }, additionalProperties: true } },
           self: { oneOf: [{ type: 'object', properties: { name: { type: 'string' }, version: { type: 'string' }, latestVersion: { type: 'string' } }, additionalProperties: true }, { type: 'null' }] },
           restartHint: { type: 'string' },
         },
@@ -1656,9 +1740,11 @@ function registerMarketTools(ctx: any): void {
       },
       render(_args: any, value: any): any[] {
         const lines: string[] = []
+        const liveZh: Record<string, string> = { active: '运行中', loading: '加载中', pending: '待加载', failed: '加载失败', unloading: '卸载中' }
         for (const p of value.plugins) {
           const upd = p.updateAvailable ? `（可更新：v${p.version} → v${p.latestVersion}，用 market_update name=${p.name}）` : ''
-          lines.push(`- ${p.name} [${p.kind}]${p.enabled ? '' : '（已停用）'} v${p.version ?? '?'}${upd}`)
+          const liveTag = !p.enabled ? '（已停用）' : p.live ? `（${liveZh[p.live] || p.live}）` : '（已启用，重启后生效）'
+          lines.push(`- ${p.name} [${p.kind}]${liveTag} v${p.version ?? '?'}${upd}`)
         }
         if (value.self) lines.push(`插件市场可更新：v${value.self.version} → v${value.self.latestVersion}（用 market_update name=${value.self.name}）`)
         if (value.plugins.length === 0) lines.push('（没有后装插件）')
@@ -1673,6 +1759,7 @@ function registerMarketTools(ctx: any): void {
           name: r.name,
           kind: r.kind,
           enabled: r.enabled,
+          live: r.live,
           version: r.version,
           latestVersion: r.latestVersion,
           updateAvailable: r.updateAvailable,
@@ -1758,7 +1845,7 @@ function registerMarketTools(ctx: any): void {
 /** Read-only view of the updates cache for tests (the live object identity). */
 function updatesCacheView(): Record<string, any> { return updatesCache }
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView, compileParameterSpec } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, mapLivePhase, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView, compileParameterSpec } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')

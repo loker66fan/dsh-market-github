@@ -80,6 +80,12 @@ const STR: Record<string, Record<string, string>> = {
     builtin: '内置插件（随 harness 提供，只读）',
     updTo: '→ v{latest}',
     specNote: '安装源',
+    liveActive: '运行中',
+    livePending: '待加载',
+    liveLoading: '加载中',
+    liveFailed: '加载失败',
+    liveUnloading: '卸载中',
+    liveStale: '已启用（重启后生效）',
   },
   en: {
     search: 'Search plugins…', all: 'All', instFilter: 'Installed', detail: 'Details', collapse: 'Collapse',
@@ -126,6 +132,12 @@ const STR: Record<string, Record<string, string>> = {
     builtin: 'Built-in plugins (shipped with the harness, read-only)',
     updTo: '→ v{latest}',
     specNote: 'source',
+    liveActive: 'running',
+    livePending: 'pending',
+    liveLoading: 'loading',
+    liveFailed: 'load failed',
+    liveUnloading: 'unloading',
+    liveStale: 'enabled (restart to load)',
   },
 }
 const t = (k: string): string => { const m = STR[LOCALE]; return (m && m[k] !== undefined) ? m[k] : (STR['zh'][k] !== undefined ? STR['zh'][k] : k) }
@@ -668,6 +680,24 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
 // Lists user-installed (third-party) plugins with enable/disable, update, and
 // uninstall actions, plus a self-update banner for the market itself. Built-in
 // template bundles are read-only and collapsed behind a toggle.
+
+/**
+ * State badge for an installed row, upgraded from the two-state
+ * enabled/disabled pill to the runtime loader phase when the host reports one
+ * (`live`): running (green) when the fiber is ACTIVE, load-failed (red) when
+ * FAILED, neutral transitional labels for pending/loading/unloading, and a
+ * neutral "enabled (restart to load)" when the file state says enabled but no
+ * loader entry exists in this process. Disabled rows keep the old badge.
+ */
+function liveBadge(p: any): ReactElement {
+  if (!p.enabled) return h('span', { className: 'mkts-state mkts-state-inactive' }, t('inactive'))
+  if (p.live === 'active') return h('span', { className: 'mkts-state mkts-state-on' }, t('liveActive'))
+  if (p.live === 'failed') return h('span', { className: 'mkts-state mkts-state-inactive' }, t('liveFailed'))
+  if (p.live === null) return h('span', { className: 'mkts-state mkts-state-off' }, t('liveStale'))
+  const label = p.live === 'loading' ? t('liveLoading') : p.live === 'unloading' ? t('liveUnloading') : t('livePending')
+  return h('span', { className: 'mkts-state mkts-state-off' }, label)
+}
+
 function InstalledPanel(): ReactElement {
   const [data, setData] = useState<any>({ phase: 'loading', plugins: [], self: null, toast: null })
   const [toggling, setToggling] = useState<string | null>(null)
@@ -733,8 +763,7 @@ function InstalledPanel(): ReactElement {
         p.spec ? h('div', { className: 'mkts-meta' }, h('span', null, t('specNote') + ': ' + String(p.spec))) : null,
       ),
       h('div', { className: 'mkts-actions' },
-        h('span', { className: 'mkts-state ' + (p.enabled ? 'mkts-state-on' : 'mkts-state-inactive') },
-          p.enabled ? t('active') : t('inactive')),
+        liveBadge(p),
         h('button', {
           className: 'mkts-cmdbtn' + (p.enabled ? '' : ' mkts-cmdbtn-primary'),
           disabled: opActive || toggling === p.name,
@@ -758,6 +787,12 @@ function InstalledPanel(): ReactElement {
       showBuiltin ? builtin.map((p: any) => h('div', { key: p.name, className: 'mkts-builtin-row' },
         h('span', null, p.name),
         h('span', { className: 'mkts-by' }, p.version ? 'v' + p.version : ''),
+        h('span', { className: 'mkts-by' + (p.live === 'failed' ? ' mkts-live-bad' : '') },
+          p.live === 'active' ? t('liveActive')
+          : p.live === 'failed' ? t('liveFailed')
+          : p.live === 'loading' ? t('liveLoading')
+          : p.live === 'pending' ? t('livePending')
+          : p.live === 'unloading' ? t('liveUnloading') : ''),
       )) : null,
     ) : null,
   )

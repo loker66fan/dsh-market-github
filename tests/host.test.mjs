@@ -444,6 +444,27 @@ check('listInstalled splits builtin/installed', instRows.some((r) => r.name === 
   && instRows.some((r) => r.name === '@deepseek-ai/dsh-web-app' && r.kind === 'builtin')
   && instRows.some((r) => r.name === 'whale-girl' && r.kind === 'installed' && r.enabled), instRows)
 
+// live field: hotCtx is a module-level let the test cannot inject (apply() got
+// a fake ctx without a loader service), so every row must project live=null —
+// exactly the "no matching loader entry in this process" path.
+check('listInstalled rows carry live (null without a loader)', instRows.every((r) => r.live === null), instRows.map((r) => [r.name, r.live]))
+
+// --- mapLivePhase: Cordis FiberState → live phase (host plugin-inventory mapping)
+if (mod.mapLivePhase) {
+  const cases = [
+    [0, 'pending'], [1, 'loading'], [2, 'active'], [3, 'failed'], [4, null], [5, 'unloading'],
+  ]
+  let allOk = true
+  for (const [state, want] of cases) {
+    if (mod.mapLivePhase(state) !== want) { allOk = false; console.error('  phase mismatch: ' + state + ' → ' + String(mod.mapLivePhase(state)) + ', want ' + String(want)) }
+  }
+  check('mapLivePhase maps all six FiberStates', allOk, cases)
+  check('mapLivePhase null for missing/unknown fiber state', mod.mapLivePhase(undefined) === null && mod.mapLivePhase(99) === null && mod.mapLivePhase(null) === null,
+    [mod.mapLivePhase(undefined), mod.mapLivePhase(99), mod.mapLivePhase(null)])
+} else {
+  check('mapLivePhase test hook exposed', false, 'no mapLivePhase export')
+}
+
 // --- resolveInstallSpec: registry specs pass through untouched (no network) ---
 const resolved = await mod.resolveInstallSpec('@some/pkg', process.execPath, 'web')
 check('resolveInstallSpec passes registry spec through', resolved.ok === true && resolved.installSpec === '@some/pkg', resolved)
