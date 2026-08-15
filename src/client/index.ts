@@ -13,7 +13,7 @@
 // The op bus state itself is module-level and resumed at apply time, so a
 // refresh or tab switch never loses an in-flight op.
 import { createElement as h, Fragment, useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { ReactElement, ReactNode } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only contributions: pull the settings SlotMap merge (so
 // `settings.plugins.tab` is a known key) and the layout SlotMap merge (so
@@ -70,6 +70,8 @@ const STR: Record<string, Record<string, string>> = {
     prev: '上一页',
     next: '下一页',
     totalResults: '共 {n} 个',
+    updatedAt: '更新于 {d}',
+    quotaHint: 'GitHub 搜索剩余配额（次/分钟）；配置 GITHUB_TOKEN 可提高',
   },
   en: {
     search: 'Search plugins…', all: 'All', instFilter: 'Installed', detail: 'Details', collapse: 'Collapse',
@@ -106,6 +108,8 @@ const STR: Record<string, Record<string, string>> = {
     prev: 'Prev',
     next: 'Next',
     totalResults: '{n} total',
+    updatedAt: 'Updated {d}',
+    quotaHint: 'GitHub search quota remaining (per minute); set GITHUB_TOKEN to raise it',
   },
 }
 const t = (k: string): string => { const m = STR[LOCALE]; return (m && m[k] !== undefined) ? m[k] : (STR['zh'][k] !== undefined ? STR['zh'][k] : k) }
@@ -244,7 +248,10 @@ function GlobalProgress(): ReactNode {
 }
 
 // ── MarketPanel: the Settings → Plugins → Plugin Market tab ─────────────────
-function MarketPanel(): ReactNode {
+// `embedded` hides the advanced host diagnostics (dsh CLI path / env probe) for
+// surfaces like the startup onboarding step, which need only search + install.
+function MarketPanel(props: { embedded?: boolean }): ReactElement {
+  const embedded = !!props.embedded
   const [data, setData] = useState<any>({ phase: 'loading', plugins: [], cats: [], installed: null, updates: null, error: null })
   const [envInfo, setEnvInfo] = useState<any>(null)
   const [binPath, setBinPath] = useState<string>((() => { try { return localStorage.getItem('mktsBin') || '' } catch { return '' } })())
@@ -306,7 +313,7 @@ function MarketPanel(): ReactNode {
         return
       }
       const plugins = r.plugins || []
-      setData((d: any) => ({ ...d, phase: 'ready', notice: null, plugins, cats: [], total: typeof r.total === 'number' ? r.total : null }))
+      setData((d: any) => ({ ...d, phase: 'ready', notice: null, plugins, cats: [], total: typeof r.total === 'number' ? r.total : null, rate: r.rate ?? null }))
       loadInstalled(plugins)
     }).catch((e) => {
       if (seq !== searchSeq.current) return // stale failure
@@ -447,11 +454,11 @@ function MarketPanel(): ReactNode {
   return h('div', { className: 'mkts' },
     toast ? h('div', { className: 'mkts-err' }, toast) : null,
     data.notice ? h('div', { className: 'mkts-notice' }, data.notice) : null,
-    envInfo ? h('div', { className: 'mkts-env' + (envReady ? '' : ' mkts-env-bad') },
+    embedded ? null : envInfo ? h('div', { className: 'mkts-env' + (envReady ? '' : ' mkts-env-bad') },
       t('envLine') + ': DSH_HOME ' + (envInfo.dshHome ? '✓ ' + envInfo.dshHome : '✗') + ' · node ' + (envInfo.node ? '✓' : '✗') + ' · dsh ' + (binOk ? '✓' : '✗') +
       ((!envInfo.dshBin && !(envInfo.binProvided && envInfo.binValid)) ? ' — dsh CLI 未定位' : ''),
     ) : null,
-    h('div', { className: 'mkts-bin-row' },
+    embedded ? null : h('div', { className: 'mkts-bin-row' },
       h('input', { className: 'mkts-bin-input', placeholder: t('binPlaceholder'), value: binPath, onChange: (e) => changeBin(e.target.value) }),
       h('button', { className: 'mkts-cmdbtn', onClick: probe }, t('reprobe')),
     ),
@@ -468,6 +475,8 @@ function MarketPanel(): ReactNode {
         h('input', { className: 'mkts-search', placeholder: t('search'), value: query, onChange: (e) => setQuery(e.target.value) }),
         liveChip,
         h('span', { className: 'mkts-count' }, showInstalled ? (filtered.length + ' ' + t('instFilter')) : fmt('totalResults', { n: totalCount })),
+        data.rate && data.rate.remaining !== null && data.rate.remaining !== undefined ? h('span', { className: 'mkts-quota', title: t('quotaHint') },
+          'GH ' + data.rate.remaining + '/' + (data.rate.limit ?? '?')) : null,
       ),
       h('div', { className: 'mkts-chips' },
         h('button', {
@@ -501,6 +510,11 @@ function MarketPanel(): ReactNode {
             p.desc ? h('p', { className: 'mkts-desc' }, p.desc) : null,
             Array.isArray(p.topics) && p.topics.length > 0 ? h('div', { className: 'mkts-topics' },
               p.topics.slice(0, 6).map((topic: string) => h('span', { key: topic, className: 'mkts-topic' }, topic)),
+            ) : null,
+            (p.lang || p.license || p.added) ? h('div', { className: 'mkts-meta' },
+              p.lang ? h('span', null, p.lang) : null,
+              p.license ? h('span', null, p.license) : null,
+              p.added ? h('span', null, fmt('updatedAt', { d: String(p.added).slice(0, 10) })) : null,
             ) : null,
             isOpen ? h('div', { className: 'mkts-detail' },
               h('div', null, t('cmdLabel')),
@@ -565,7 +579,7 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
         ),
         h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-primary', onClick: () => { if (props.complete) props.complete() } }, t('done')),
       ),
-      h('div', { className: 'mkts-ob-body' }, h(MarketPanel)),
+      h('div', { className: 'mkts-ob-body' }, h(MarketPanel, { embedded: true })),
     ),
   )
 }

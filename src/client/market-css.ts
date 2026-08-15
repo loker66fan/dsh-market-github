@@ -43,6 +43,8 @@ export const MARKET_CSS = `
 .mkts-topics{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
 .mkts-topic{font-size:10.5px;font-family:ui-monospace,monospace;color:var(--dsw-alias-label-tertiary);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:0 8px;line-height:16px}
 .mkts-topic:hover{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-label-dimmed)}
+.mkts-meta{display:flex;flex-wrap:wrap;gap:10px;margin-top:5px;font-size:11px;font-family:ui-monospace,monospace;color:var(--dsw-alias-label-tertiary)}
+.mkts-quota{font-family:ui-monospace,monospace;font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:nowrap;cursor:help}
 .mkts-actions{flex:none;display:flex;flex-direction:column;gap:4px;align-items:flex-end}
 .mkts-cmdbtn{appearance:none;background:none;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);padding:3px 12px;cursor:pointer;white-space:nowrap}
 .mkts-cmdbtn:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed)}

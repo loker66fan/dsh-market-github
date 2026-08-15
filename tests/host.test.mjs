@@ -136,6 +136,15 @@ check('buildSearchQuery always has topic + noise filters', /topic:dsh-plugin/.te
 const bqTerm = mod.buildSearchQuery('terminal')
 check('buildSearchQuery appends user terms', /terminal/.test(bqTerm) && bqTerm.startsWith('topic:dsh-plugin '), bqTerm)
 
+// --- npm-prefer install helpers (registry verification against the repo) ---
+check('normalizeRepoUrl strips git+https and .git', mod.normalizeRepoUrl('git+https://github.com/acme/plugin.git') === 'acme/plugin', mod.normalizeRepoUrl('git+https://github.com/acme/plugin.git'))
+check('normalizeRepoUrl handles ssh form', mod.normalizeRepoUrl('git@github.com:acme/plugin.git') === 'acme/plugin', mod.normalizeRepoUrl('git@github.com:acme/plugin.git'))
+check('normalizeRepoUrl lowercases', mod.normalizeRepoUrl('https://github.com/Acme/Plugin') === 'acme/plugin', mod.normalizeRepoUrl('https://github.com/Acme/Plugin'))
+const noNet = await mod.npmRegistrySpec('github:a/b', 'not a valid name!')
+check('npmRegistrySpec rejects invalid name without network', noNet === null, noNet)
+const bogus = await mod.npmRegistrySpec('github:a/b', 'mkts-bogus-pkg-9f8e7d6c5b4a')
+check('npmRegistrySpec null for unpublished name', bogus === null, bogus)
+
 // --- restart route: rejected unless same-origin AND direct loopback ---
 const restCross = await call({ method: 'restart' }, { origin: 'http://evil.example' })
 check('restart rejected cross-origin', restCross.ok === false && /untrusted/.test(restCross.error || ''), restCross)

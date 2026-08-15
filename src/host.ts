@@ -280,7 +280,7 @@ const RAW_MIRRORS = [
  * Classify a github: source. A manifest declaring a web client half is
  * certainly a web-profile plugin and can install without a trial boot.
  */
-async function classifyPlugin(source: string): Promise<{ known: boolean; webClient: boolean; fetchFailed?: boolean }> {
+async function classifyPlugin(source: string): Promise<{ known: boolean; webClient: boolean; fetchFailed?: boolean; pkgName?: string | null }> {
   const spec = String(source || '')
   const m = /^github:([^/]+)\/([^/]+?)(?:\.git)?$/.exec(spec)
   if (!m) return { known: false, webClient: false }
@@ -300,7 +300,49 @@ async function classifyPlugin(source: string): Promise<{ known: boolean; webClie
   if (pkg === null || typeof pkg !== 'object') return { known: false, webClient: false, fetchFailed: true }
   const dsh = pkg.dsh && typeof pkg.dsh === 'object' ? pkg.dsh : {}
   const client = dsh.client
-  return { known: true, webClient: client !== undefined && client.platform === 'web' }
+  const pkgName = typeof pkg.name === 'string' && pkg.name !== '' ? pkg.name : null
+  return { known: true, webClient: client !== undefined && client.platform === 'web', pkgName }
+}
+
+/**
+ * Normalize an npm registry repository field to `owner/repo` for comparison:
+ * strips git+/ssh/https/git@ prefixes, the .git suffix, and trailing slashes.
+ */
+function normalizeRepoUrl(value: unknown): string {
+  const s = String(value || '').trim()
+  return s
+    .replace(/^git\+/, '')
+    .replace(/\.git$/, '')
+    .replace(/^https?:\/\/(www\.)?github\.com\//i, '')
+    .replace(/^git@github\.com:/i, '')
+    .replace(/^github\.com\//i, '')
+    .replace(/\/+$/, '')
+    .toLowerCase()
+}
+
+/**
+ * Resolve whether a github: plugin is also published to npm under the same
+ * repository — registry installs are seconds (tarball, no prepare script).
+ * The registry package's `repository` field must point at the exact repo
+ * (name-squatting guard); any mismatch or lookup failure returns null so the
+ * install falls back to the GitHub source.
+ */
+async function npmRegistrySpec(target: string, pkgName: string | null): Promise<string | null> {
+  if (pkgName === null || !/^(@[a-z0-9-_.~]+\/)?[a-z0-9-_.~]+$/.test(pkgName)) return null
+  const repoKey = String(target).replace(/^github:/i, '').replace(/\.git$/i, '').toLowerCase()
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkgName)}/latest`, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(6000),
+    })
+    if (!res.ok) return null
+    const meta: any = await res.json()
+    const repo = meta.repository && (meta.repository.url || meta.repository)
+    if (normalizeRepoUrl(repo) !== repoKey) return null
+    return pkgName
+  } catch {
+    return null
+  }
 }
 
 const PROBE_INSTALL_TIMEOUT = 240000
@@ -405,11 +447,13 @@ function mapGitHubItem(item: any): any {
     stars: typeof item.stargazers_count === 'number' ? item.stargazers_count : null,
     added: item.pushed_at || item.created_at || null,
     topics: Array.isArray(item.topics) ? item.topics : [],
+    lang: typeof item.language === 'string' ? item.language : null,
+    license: item.license && typeof item.license.spdx_id === 'string' ? item.license.spdx_id : null,
   }
 }
 
 /** Server-side cache for GitHub search (short TTL to respect the rate limit). */
-const searchCache = new Map<string, { at: number; data: { plugins: any[]; total: number } }>()
+const searchCache = new Map<string, { at: number; data: { plugins: any[]; total: number; rate?: { limit: string | null; remaining: string | null } } }>()
 const SEARCH_TTL_MS = 60 * 1000
 
 /**
@@ -434,7 +478,7 @@ function buildSearchQuery(q: string): string {
 async function searchGitHub(
   query: string,
   opts: { sort?: string; order?: string; page?: number; perPage?: number } = {},
-): Promise<{ plugins: any[]; total: number; error?: string }> {
+): Promise<{ plugins: any[]; total: number; rate?: { limit: string | null; remaining: string | null }; error?: string }> {
   const q = String(query || '').trim()
   const sort = opts.sort === 'updated' ? 'updated' : 'stars'
   const order = opts.order === 'asc' ? 'asc' : 'desc'
@@ -456,13 +500,18 @@ async function searchGitHub(
       const remaining = res.headers.get('x-ratelimit-remaining')
       return {
         plugins: [], total: 0,
+        rate: { limit: res.headers.get('x-ratelimit-limit'), remaining },
         error: 'GitHub 搜索限速（剩余 ' + (remaining ?? '0') + ' 次/分钟）。配置 GITHUB_TOKEN 可提高配额，或稍后重试。',
       }
     }
     if (!res.ok) throw new Error('HTTP ' + res.status)
     const data: any = await res.json()
     const plugins = (Array.isArray(data.items) ? data.items : []).map(mapGitHubItem)
-    const result = { plugins, total: typeof data.total_count === 'number' ? data.total_count : plugins.length }
+    const result = {
+      plugins,
+      total: typeof data.total_count === 'number' ? data.total_count : plugins.length,
+      rate: { limit: res.headers.get('x-ratelimit-limit'), remaining: res.headers.get('x-ratelimit-remaining') },
+    }
     searchCache.set(cacheKey, { at: Date.now(), data: result })
     return result
   } catch (e: any) {
@@ -754,7 +803,7 @@ async function checkUpdates(profile: string): Promise<Record<string, any>> {
 const UPDATES_TTL_MS = 10 * 60 * 1000
 let updatesCache: Record<string, any> = {}
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -781,7 +830,7 @@ export function apply(ctx: any): void {
             perPage: Number(body.perPage || 30),
           })
           if (r.error !== undefined) return sendJson(res, 502, { ok: false, error: r.error })
-          return sendJson(res, 200, { ok: true, plugins: r.plugins, total: r.total, source: 'github' })
+          return sendJson(res, 200, { ok: true, plugins: r.plugins, total: r.total, rate: r.rate ?? null, source: 'github' })
         }
         if (method === 'probe') {
           const explicit = String(body.binPath || '').trim()
@@ -881,6 +930,7 @@ export function apply(ctx: any): void {
             // bundle-only plugins, a throwaway trial boot) before touching the
             // real profile. Registry specs skip the probe — pnpm and the Loader
             // fail loud on boot if they are not loadable.
+            let installSpec = target
             if (/^github:/.test(target)) {
               const cls = await classifyPlugin(target)
               if (!cls.known) {
@@ -905,14 +955,19 @@ export function apply(ctx: any): void {
                       + '\n\n如需强制安装（风险自负），请勾选"跳过安全检查"。',
                   })
                 }
+              } else {
+                // Web-client plugin: prefer a registry-verified npm tarball
+                // (seconds, no prepare script); fall back to the GitHub source.
+                const npm = await npmRegistrySpec(target, cls.pkgName ?? null)
+                if (npm !== null) installSpec = npm
               }
             }
             const snap = snapshotProfile(profile)
             const label = String(body.label || target)
-            const started = startOp(method, profile, target, label, bin,
+            const started = startOp(method, profile, installSpec, label, bin,
               snap ? '已备份安装前状态：' + snap + '\n' : '')
             if (!started.ok) return sendJson(res, 200, started)
-            return sendJson(res, 200, { ok: true, opId: started.opId, timeoutMs: DEFAULT_TIMEOUT })
+            return sendJson(res, 200, { ok: true, opId: started.opId, timeoutMs: DEFAULT_TIMEOUT, spec: installSpec })
           }
           const label = String(body.label || target)
           if (method === 'uninstall') {

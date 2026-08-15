@@ -19,8 +19,8 @@ An in-harness plugin market for the dsh web GUI: **startup-page onboarding entry
 ## 功能 Features
 
 - **启动页入口**：首次运行（尚无会话）时，onboarding 引导多出「插件商城」步骤；也可随时从 设置 → 插件 → 插件市场 打开。
-- **GitHub 实时搜索**：host 端代理 `api.github.com/search/repositories`，搜索框防抖 350ms 实时请求，每页 50 条 + 上一页/下一页翻页；自动过滤 fork、归档、私有仓库。空查询返回最热插件，支持按 Star / 最近更新排序。
-- **一键安装**：安装/更新/卸载走后台任务，全应用右下角进度浮条常驻（切页面不丢），可终止、可最小化；简单插件装好后**热挂载免重启**。
+- **GitHub 实时搜索**：host 端代理 `api.github.com/search/repositories`，搜索框防抖 350ms 实时请求，每页 50 条 + 上一页/下一页翻页；自动过滤 fork、归档、私有仓库。空查询返回最热插件，支持按 Star / 最近更新排序；卡片显示 topics、语言、许可证、更新时间；搜索配额（GH remaining/limit）可见，配 `GITHUB_TOKEN` 可提高。
+- **一键安装**：安装/更新/卸载走后台任务，全应用右下角进度浮条常驻（切页面不丢），可终止、可最小化；**已发布 npm 的插件优先走 registry tarball 安装（registry 校验与仓库一致防抢注，否则回退 GitHub 源）**；简单插件装好后**热挂载免重启**。
 - **安装安全把关**：GitHub 源先读其 `package.json` 的 `dsh` 清单——声明 `dsh.client` 的 web 插件直接安装；仅声明 `dsh.bundle` 的走**临时环境试装启动验证**（真实 profile 不受影响）；读不到清单则拒绝（可勾选「跳过安全检查」）。
 - **启用 / 停用**：编辑 profile 的 `dsh.profile.bundles` 层；停用立即生效（保留依赖、只去配置层），启用尝试热挂载。
 - **一键重启**：安装/停用后需要重启时，横幅自带「立即重启」按钮（同源 + 直连 loopback 双重校验，detached 拉起同一命令），重启完成后页面自动刷新。
