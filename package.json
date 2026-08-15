@@ -1,11 +1,11 @@
 {
   "name": "dsh-market-github",
-  "description": "In-harness plugin market for the dsh web GUI — startup-page onboarding entry + real-time GitHub topic:dsh-plugin search with pagination, one-click install with never-lost progress, trial-boot verification, enable/disable, and one-click restart. Fork of @sanqi-normal/dsh-webui-market-plugin.",
+  "description": "In-harness plugin market for the dsh web GUI — startup-page onboarding entry + real-time GitHub topic:dsh-plugin search with pagination, one-click install with never-lost progress, trial-boot verification, enable/disable, and one-click restart.",
   "version": "0.3.0",
   "type": "module",
   "author": {
-    "name": "Sanqi-normal (original author), forked by condaThinker",
-    "url": "https://github.com/Sanqi-normal/dsh-webui-market-plugin"
+    "name": "loker66fan",
+    "url": "https://github.com/loker66fan"
   },
   "repository": {
     "type": "git",

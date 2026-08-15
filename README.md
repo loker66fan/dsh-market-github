@@ -1,16 +1,6 @@
 # dsh-market-github
 
-> **Fork / 分叉说明（不是原创）** — 本项目是社区插件
-> **[`@sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)**
-> 的一个 **fork（分支）**，基于其 MIT 代码二次开发，**原作者为 Sanqi-normal**。
-> 本仓库的维护者**并非原作者**；请把原作者应有的致谢与 credit 归于
-> [`@Sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)。
->
-> **Attribution / Credit**: This is a **fork** — not an original project. Derived
-> from the MIT-licensed plugin
-> [`@Sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)
-> by **Sanqi-normal** (the original author). This fork's maintainer is **not** the
-> original author; please attribute the original work to the upstream repo above.
+> 参考项目（MIT）：[@sanqi-normal/dsh-webui-market-plugin](https://github.com/Sanqi-normal/dsh-webui-market-plugin) 与 [@condaThinker/dsh-webui-market-plugin-plus](https://github.com/condaThinker/dsh-webui-market-plugin-plus)，致谢见文末。
 
 在 dsh web GUI 内部的插件商城：**启动页引导入口 + GitHub `topic:dsh-plugin` 实时搜索 + 一键安装/启用停用/一键重启**。
 
@@ -121,10 +111,13 @@ npm test           # node --test tests/*.test.mjs
 
 ## 致谢 Credits
 
-- 原作者 [@Sanqi-normal/dsh-webui-market-plugin](https://github.com/Sanqi-normal/dsh-webui-market-plugin)（MIT）——市场 UI、后台安装、试装验证的原始实现。
-- [@condaThinker/dsh-webui-market-plugin-plus](https://github.com/condaThinker/dsh-webui-market-plugin-plus)（MIT）——全局进度浮条、可终止安装、启用/停用。
-- 本仓库在此基础上二次开发：启动页 onboarding 入口、GitHub 实时搜索 + 翻页、codeload tarball 安装、设备代理自动识别、纯客户端插件合成行、模型可用 market_* 工具、一键重启。
+本仓库作者：**loker66fan**。开发过程中参考了以下 MIT 项目，谨此致谢：
+
+- 参考项目 [@Sanqi-normal/dsh-webui-market-plugin](https://github.com/Sanqi-normal/dsh-webui-market-plugin)（MIT）——市场 UI、后台安装、试装验证的思路来源。
+- 参考项目 [@condaThinker/dsh-webui-market-plugin-plus](https://github.com/condaThinker/dsh-webui-market-plugin-plus)（MIT）——全局进度浮条、可终止安装、启用/停用的思路来源。
+
+本仓库在参考基础上完善的功能：启动页 onboarding 入口、GitHub 实时搜索 + 翻页、codeload tarball 安装、设备代理自动识别、纯客户端插件合成行、模型可用 `market_*` 工具、一键重启。
 
 ## License
 
-MIT. Forked from [Sanqi-normal/dsh-webui-market-plugin](https://github.com/Sanqi-normal/dsh-webui-market-plugin) (also MIT).
+MIT. 参考 [Sanqi-normal/dsh-webui-market-plugin](https://github.com/Sanqi-normal/dsh-webui-market-plugin)（亦为 MIT）编写；版权声明见 [LICENSE](LICENSE)。
