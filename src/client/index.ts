@@ -297,6 +297,9 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
   // Local 1s ticker: keeps the starting-phase waiting timer moving between
   // (infrequent) op-bus updates.
   const [, tick] = useState(0)
+  // Top of the panel: paging swaps the whole list, so jump the viewport back
+  // here (the pager otherwise leaves the user stuck at the bottom).
+  const topRef = useRef<HTMLDivElement | null>(null)
   const op = getOp()
 
   useEffect(() => {
@@ -384,6 +387,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
     if (n < 1 || n > pageCount(total) || n === page) return
     setPage(n)
     runSearch(query, sortBy, n)
+    topRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }
 
   // Refresh installed/active state when an op settles (install/update/uninstall/
@@ -497,7 +501,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
 
   const toast = data.toast
 
-  return h('div', { className: 'mkts' },
+  return h('div', { className: 'mkts', ref: topRef },
     toast ? h('div', { className: 'mkts-err' }, toast) : null,
     data.self && data.self.updateAvailable ? h('div', { className: 'mkts-selfupdate' },
       h('span', { style: { flex: 1 } }, fmt('selfUpdate', { cur: data.self.version, latest: data.self.latestVersion })),
@@ -665,7 +669,7 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
 // uninstall actions, plus a self-update banner for the market itself. Built-in
 // template bundles are read-only and collapsed behind a toggle.
 function InstalledPanel(): ReactElement {
-  const [data, setData] = useState<any>({ phase: 'loading', plugins: [], self: null })
+  const [data, setData] = useState<any>({ phase: 'loading', plugins: [], self: null, toast: null })
   const [toggling, setToggling] = useState<string | null>(null)
   const [showBuiltin, setShowBuiltin] = useState(false)
 
@@ -688,10 +692,18 @@ function InstalledPanel(): ReactElement {
 
   const toggle = (row: any): void => {
     setToggling(row.name)
-    apiOp('toggleActive', { profile: 'web', name: row.name, enabled: !row.enabled }).then(() => {
+    apiOp('toggleActive', { profile: 'web', name: row.name, enabled: !row.enabled }).then((r) => {
       setToggling(null)
-      load()
-    }).catch(() => setToggling(null))
+      if (r && r.ok) {
+        setData((d: any) => ({ ...d, toast: r.needsRestart ? t('restartBanner') : (r.active ? t('activeLive') : t('inactiveLive')) }))
+        load()
+      } else {
+        setData((d: any) => ({ ...d, toast: String((r && (r.error || r.output)) || t('opFailed')) }))
+      }
+    }).catch((e) => {
+      setToggling(null)
+      setData((d: any) => ({ ...d, toast: String((e && e.message) || t('opFailed')) }))
+    })
   }
 
   const installed = (data.plugins || []).filter((p: any) => p.kind === 'installed')
@@ -699,6 +711,7 @@ function InstalledPanel(): ReactElement {
   const opActive = !!(getOp() && getOp()!.phase !== 'done')
 
   return h('div', { className: 'mkts' },
+    data.toast ? h('div', { className: 'mkts-err' }, data.toast) : null,
     data.self && data.self.updateAvailable ? h('div', { className: 'mkts-selfupdate' },
       h('span', { style: { flex: 1 } }, fmt('selfUpdate', { cur: data.self.version, latest: data.self.latestVersion })),
       h('button', {
