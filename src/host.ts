@@ -849,6 +849,37 @@ function removeClientRow(profile: string, packageName: string): void {
   }
 }
 
+/** Whether the synthetic loader row for a client-only package exists. */
+function clientRowPresent(profile: string, packageName: string): boolean {
+  const p = join(profileDir(profile), 'cordis.patch.yml')
+  if (!existsSync(p)) return false
+  const text = readFileSync(p, 'utf8')
+  return text.includes("name: '" + packageName + "'") || text.includes('name: "' + packageName + '"')
+}
+
+/** Names of all synthetic client rows currently in the profile patch. */
+function readClientRows(profile: string): string[] {
+  const p = join(profileDir(profile), 'cordis.patch.yml')
+  if (!existsSync(p)) return []
+  const text = readFileSync(p, 'utf8')
+  const rows: string[] = []
+  for (const m of text.matchAll(/-\s+id:\s+dsh-market-client-[\w-]+\n\s+name:\s+'([^']+)'/g)) {
+    rows.push(m[1])
+  }
+  return rows
+}
+
+/** Bound an await so a stuck loader mutation can never hang a request path. */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timed = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms) })
+  try {
+    return await Promise.race([p, timed])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** FiberState.ACTIVE — Cordis's const enum value (no cross-package import here). */
 const FIBER_ACTIVE = 2
 /** FiberState.FAILED. */
@@ -1025,6 +1056,26 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
   if (deps[name] === undefined) {
     return { ok: false, error: '插件未安装：' + name }
   }
+  // Client-only plugin (dsh.client, no dsh.bundle): its activation IS the
+  // synthetic loader row in the profile patch — it must NEVER be written into
+  // dsh.profile.bundles (a bundle-less package there fails the next boot with
+  // "declares no dsh.bundle"). The browser roster is boot-time fixed, so both
+  // directions take effect on restart.
+  if (hasWebClient(profile, name) && !hasBundleManifest(profile, name)) {
+    const rowPresent = clientRowPresent(profile, name)
+    if (enabled && rowPresent) return { ok: true, active: true, message: 'already active' }
+    if (!enabled && !rowPresent) return { ok: true, active: false, message: 'already inactive' }
+    if (enabled) {
+      if (!ensureClientRow(profile, name)) {
+        return { ok: false, error: '写入配置行失败：' + profileDir(profile) + '/cordis.patch.yml' }
+      }
+    } else {
+      removeClientRow(profile, name)
+      await withTimeout(disposeHotMount(name), 4000)
+      await withTimeout(disableLoaderEntry(name), 4000)
+    }
+    return { ok: true, active: enabled, needsRestart: true, message: enabled ? 'enabled:restart' : 'disabled:restart' }
+  }
   const bundles = readProfileBundles(profile)
   const idx = bundles.findIndex((b) => normalizeBundleName(b) === normalizeBundleName(name))
   const present = idx >= 0
@@ -1039,8 +1090,8 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
 
   if (!enabled) {
     // Stop serving immediately: dispose hot mount + disable loader entry.
-    await disposeHotMount(name)
-    await disableLoaderEntry(name)
+    await withTimeout(disposeHotMount(name), 4000)
+    await withTimeout(disableLoaderEntry(name), 4000)
   }
 
   // For enable, try live hot-mount (only makes sense if the package declares a
@@ -1209,7 +1260,12 @@ async function listInstalled(profile: string): Promise<InstalledRow[]> {
     })
   }
   for (const [name, spec] of Object.entries(deps)) {
-    const enabled = bundles.some((b) => normalizeBundleName(b) === normalizeBundleName(name))
+    // Client-only plugins (dsh.client, no dsh.bundle) are "enabled" by their
+    // synthetic row in the profile patch, never by the bundles list.
+    const clientOnly = hasWebClient(profile, name) && !hasBundleManifest(profile, name)
+    const enabled = clientOnly
+      ? clientRowPresent(profile, name)
+      : bundles.some((b) => normalizeBundleName(b) === normalizeBundleName(name))
     const up = updates[name] as { latest?: string | null; updateAvailable?: boolean } | undefined
     rows.push({
       name,
@@ -1468,7 +1524,7 @@ function registerMarketTools(ctx: any): void {
   console.log('[dsh-market] registered model tools: market_search, market_install, market_installed, market_update')
 }
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -1533,6 +1589,7 @@ export function apply(ctx: any): void {
             profile,
             bundles: Array.isArray(json.dsh && json.dsh.profile && json.dsh.profile.bundles) ? json.dsh.profile.bundles : [],
             dependencies: json.dependencies || {},
+            clientRows: readClientRows(profile),
             plugins,
             self,
           })
@@ -1621,8 +1678,8 @@ export function apply(ctx: any): void {
           }
           const label = String(body.label || target)
           if (method === 'uninstall') {
-            await disposeHotMount(target)
-            await disableLoaderEntry(target)
+            await withTimeout(disposeHotMount(target), 4000)
+            await withTimeout(disableLoaderEntry(target), 4000)
           }
           await waitProxyReady(2000)
           const started = startOp(method, profile, target, label, String(body.binPath || '').trim())

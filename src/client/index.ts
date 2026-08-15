@@ -180,7 +180,10 @@ function isActive(plugin: any, installedMap: any): boolean {
   if (!pkgName || !state) return false
   const norm = (s: string) => String(s).toLowerCase().replace(/^github:/, '').replace(/\.git$/, '').replace(/#.*$/, '')
   const needle = norm(pkgName)
+  // Bundle plugins activate through the bundles layer; client-only plugins
+  // (dsh.client, no dsh.bundle) activate through their synthetic client row.
   return (state.bundles || []).some((b: string) => norm(b) === needle)
+    || (Array.isArray(state.clientRows) && state.clientRows.some((b: string) => norm(b) === needle))
 }
 
 /** Active-state descriptor for installed cards. */

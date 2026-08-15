@@ -79,6 +79,10 @@ let opLostMessage = '任务状态丢失（服务可能已重启或任务被其�
 export function setOpLostMessage(s: string): void { opLostMessage = s }
 
 function pollOp(opId: string): void {
+  // A fresh poll for the CURRENT op begins now: clear the stop flag that a
+  // prior openOp()/stopPolling() set, otherwise step() returns immediately and
+  // the elapsed timer sits frozen at 0s forever (never reaches 'done' either).
+  pollStop = false
   const step = () => {
     if (pollStop) return
     apiOp('op', { opId }).then((r) => {
