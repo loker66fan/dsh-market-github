@@ -20,11 +20,14 @@ An in-harness plugin market for the dsh web GUI: **startup-page onboarding entry
 
 - **启动页入口**：首次运行（尚无会话）时，onboarding 引导多出「插件商城」步骤；也可随时从 设置 → 插件 → 插件市场 打开。
 - **GitHub 实时搜索**：host 端代理 `api.github.com/search/repositories`，搜索框防抖 350ms 实时请求，每页 50 条 + 上一页/下一页翻页；自动过滤 fork、归档、私有仓库。空查询返回最热插件，支持按 Star / 最近更新排序；卡片显示 topics、语言、许可证、更新时间；搜索配额（GH remaining/limit）可见，配 `GITHUB_TOKEN` 可提高。
-- **一键安装**：安装/更新/卸载走后台任务，全应用右下角进度浮条常驻（切页面不丢），可终止、可最小化；**已发布 npm 的插件优先走 registry tarball 安装（registry 校验与仓库一致防抢注，否则回退 GitHub 源）**；简单插件装好后**热挂载免重启**。
-- **安装安全把关**：GitHub 源先读其 `package.json` 的 `dsh` 清单——声明 `dsh.client` 的 web 插件直接安装；仅声明 `dsh.bundle` 的走**临时环境试装启动验证**（真实 profile 不受影响）；读不到清单则拒绝（可勾选「跳过安全检查」）。
+- **一键安装**：安装/更新/卸载走后台任务，全应用右下角进度浮条常驻（切页面不丢），可终止、可最小化；**已发布 npm 的插件优先走 registry tarball 安装（registry 校验与仓库一致防抢注，否则回退 GitHub 源）**；纯 host 插件装好后**热挂载免重启**（校验 fiber 真实激活才报成功）。
+- **可靠网络**：**自动识别设备代理**（环境变量 → 系统代理 → Clash/mihomo/v2rayN 常见端口探测），无需手动配置；GitHub 源走 **codeload tarball 直链**（绕开易卡的 git 协议）；清单校验在 raw.githubusercontent 被封时自动回退 GitHub contents API / jsDelivr / ghproxy。
+- **安装安全把关**：GitHub 源先读其 `package.json` 的 `dsh` 清单——声明 `dsh.client` 的 web 插件直接安装；仅声明 `dsh.bundle` 的走**临时环境试装启动验证**（真实 profile 不受影响）；读不到清单则拒绝（可勾选「跳过安全检查」）。pnpm 构建放行按**精确键**（裸包名 + `包名@tarball地址`）写入，scoped 包名加引号防 YAML 解析失败。
+- **纯客户端插件支持**：只有 `dsh.client` 没有 `dsh.bundle` 的插件（如主题/UI 插件）安装后**自动写入合成配置行**，重启即加载；卸载时同步移除。
 - **启用 / 停用**：编辑 profile 的 `dsh.profile.bundles` 层；停用立即生效（保留依赖、只去配置层），启用尝试热挂载。
 - **一键重启**：安装/停用后需要重启时，横幅自带「立即重启」按钮（同源 + 直连 loopback 双重校验，detached 拉起同一命令），重启完成后页面自动刷新。
 - **更新检测**：GitHub 源比对锁文件 commit 与 HEAD，npm 源比对 registry 版本；一键更新。
+- **模型可用**：注册 `market_search` / `market_install` / `market_installed` / `market_update` 工具，agent 可直接搜索并安装插件。
 
 ## 安装 Install
 
@@ -72,9 +75,10 @@ dsh web
 
 - 写操作（install/uninstall/update/kill/toggleActive）仅接受同源 POST；`restart` 额外要求直连 loopback 客户端（转发请求被拒）。
 - GitHub 源装前校验 `dsh` 清单；无 `dsh.client` 的走临时环境试装启动验证，验证失败不改动现有安装。
-- GitHub 源会执行包内 `prepare` 脚本（由 pnpm 授权机制约束），且不在 agent 沙箱内——只装你信任的源。
+- GitHub 源会执行包内 `prepare` 脚本（市场只对已验证的包精确放行 `allowBuilds`），且不在 agent 沙箱内——只装你信任的源。
 - 搜索受 GitHub API 限速（未鉴权 10 次/分钟，服务端 60s 短缓存；`GITHUB_TOKEN` 可提高）。
-- 热挂载只支持 patch 结构简单的插件；复杂 patch 需重启（面板会给出「立即重启」）。
+- 热挂载只支持 patch 结构简单且**无 Web 客户端**的插件；含 `dsh.client` 的插件需重启（横幅自带「立即重启」）。
+- 代理自动探测最多等待数秒，极端网络下安装会回退直连 codeload；探测到的代理仅注入安装子进程，不影响 dsh 自身流量。
 - 本市场本身不是安全审查：列表存在 ≠ 背书。
 
 ## 开发 Development
@@ -92,7 +96,7 @@ npm test           # node --test tests/*.test.mjs
 
 - 原作者 [@Sanqi-normal/dsh-webui-market-plugin](https://github.com/Sanqi-normal/dsh-webui-market-plugin)（MIT）——市场 UI、后台安装、试装验证的原始实现。
 - [@condaThinker/dsh-webui-market-plugin-plus](https://github.com/condaThinker/dsh-webui-market-plugin-plus)（MIT）——全局进度浮条、可终止安装、启用/停用。
-- 本仓库在此基础上二次开发：启动页 onboarding 入口、GitHub 实时搜索 + 翻页、搜索噪音过滤、竞态保护、一键重启。
+- 本仓库在此基础上二次开发：启动页 onboarding 入口、GitHub 实时搜索 + 翻页、codeload tarball 安装、设备代理自动识别、纯客户端插件合成行、模型可用 market_* 工具、一键重启。
 
 ## License
 
