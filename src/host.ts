@@ -237,15 +237,37 @@ function startOp(kind: string, profile: string, target: string, label: string, e
     if (op.status !== 'running') return
     const ok = code === 0
     if (ok && op.kind === 'install' && hotCtx !== null) {
-      const result = await tryHotMountAll(hotCtx, op.profile, op.beforeDeps)
-      if (result.hot) {
-        op.hot = true
-        appendOutput(op, '\n[hot] 已热挂载（无需重启，刷新页面即可使用）\n')
-      } else if (result.reason === 'web-client-half') {
-        appendOutput(op, '\n[hot] 该插件包含 Web 客户端，前端清单在启动时已固定，重启 web 后生效（可用横幅的「立即重启」）\n')
-      } else {
-        appendOutput(op, '\n[hot] 热挂载不可用（插件 patch 较复杂或激活验证未通过），重启 web 后生效\n')
+      const after = readProfileDeps(op.profile)
+      const added = Object.keys(after).filter((n) => op.beforeDeps[n] === undefined)
+      // A client-only plugin (dsh.client, no dsh.bundle) cannot self-register:
+      // the browser roster scans Loader entries, so it needs a synthetic row
+      // in the profile patch. Scan ALL installed deps (a previous failed
+      // attempt may have left the dep present), idempotently.
+      let clientRows = 0
+      for (const n of Object.keys(after)) {
+        if (hasWebClient(op.profile, n) && !hasBundleManifest(op.profile, n) && ensureClientRow(op.profile, n)) {
+          clientRows += 1
+        }
       }
+      if (clientRows > 0) {
+        appendOutput(op, '\n[client] 已为 ' + String(clientRows) + ' 个纯客户端插件写入 profile 配置行，重启 web 后生效\n')
+      }
+      if (added.length > 0) {
+        const result = await tryHotMountAll(hotCtx, op.profile, op.beforeDeps)
+        if (result.hot) {
+          op.hot = true
+          appendOutput(op, '\n[hot] 已热挂载（无需重启，刷新页面即可使用）\n')
+        } else if (result.reason === 'web-client-half') {
+          appendOutput(op, '\n[hot] 该插件包含 Web 客户端，前端清单在启动时已固定，重启 web 后生效（可用横幅的「立即重启」）\n')
+        } else {
+          appendOutput(op, '\n[hot] 热挂载不可用（插件 patch 较复杂或激活验证未通过），重启 web 后生效\n')
+        }
+      }
+    }
+    if (ok && op.kind === 'uninstall') {
+      // Drop any synthetic client row the install wrote, so a leftover row
+      // cannot fail the next boot pointing at a removed package.
+      removeClientRow(op.profile, op.target)
     }
     settleOp(op, ok ? 'done' : 'failed', code)
   })
@@ -276,7 +298,22 @@ function killOp(): { ok: boolean; error?: string } {
 const RAW_MIRRORS = [
   'https://raw.githubusercontent.com',
   'https://raw.gitmirror.com',
+  'https://cdn.jsdelivr.net/gh',
+  'https://ghproxy.net/https://raw.githubusercontent.com',
 ]
+
+/** Candidate package.json URLs for a repo, in most-likely-to-succeed order. */
+function manifestUrls(owner: string, repo: string): string[] {
+  const urls = [
+    `${RAW_MIRRORS[0]}/${owner}/${repo}/HEAD/package.json`,
+    `${RAW_MIRRORS[1]}/${owner}/${repo}/HEAD/package.json`,
+  ]
+  for (const branch of ['main', 'master']) {
+    urls.push(`${RAW_MIRRORS[2]}/${owner}/${repo}@${branch}/package.json`)
+  }
+  urls.push(`${RAW_MIRRORS[3]}/${owner}/${repo}/HEAD/package.json`)
+  return urls
+}
 
 /**
  * Classify a github: source. A manifest declaring a web client half is
@@ -288,16 +325,28 @@ async function classifyPlugin(source: string): Promise<{ known: boolean; webClie
   if (!m) return { known: false, webClient: false }
   const [, owner, repo] = m
   let pkg: Record<string, any> | null = null
-  for (const base of RAW_MIRRORS) {
-    try {
-      const r = await fetch(`${base}/${owner}/${repo}/HEAD/package.json`, {
-        redirect: 'follow',
-        signal: AbortSignal.timeout(10000),
-      })
-      if (!r.ok) continue
-      pkg = await r.json()
-      break
-    } catch {}
+  // GitHub contents API (raw media type) first: api.github.com is the host
+  // that stays reachable where raw.githubusercontent is blocked. Rate limits
+  // or failure fall through to the raw CDN mirrors.
+  try {
+    const api = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/package.json`, {
+      headers: { accept: 'application/vnd.github.raw+json', 'user-agent': 'dsh-market', ...gitHubAuth() },
+      signal: AbortSignal.timeout(10000),
+    })
+    if (api.ok) pkg = await api.json()
+  } catch {}
+  if (pkg === null) {
+    for (const url of manifestUrls(owner, repo)) {
+      try {
+        const r = await fetch(url, {
+          redirect: 'follow',
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!r.ok) continue
+        pkg = await r.json()
+        break
+      } catch {}
+    }
   }
   if (pkg === null || typeof pkg !== 'object') return { known: false, webClient: false, fetchFailed: true }
   const dsh = pkg.dsh && typeof pkg.dsh === 'object' ? pkg.dsh : {}
@@ -320,6 +369,18 @@ function normalizeRepoUrl(value: unknown): string {
     .replace(/^github\.com\//i, '')
     .replace(/\/+$/, '')
     .toLowerCase()
+}
+
+/**
+ * Convert a github: source to a codeload tarball URL. Direct git access to
+ * github.com hangs on some networks while codeload (Fastly CDN) stays fast,
+ * so git-hosted installs prefer the tarball — pnpm treats it as a normal
+ * dependency (prepare script still subject to the build-block consent).
+ */
+function codeloadSpec(target: string): string | null {
+  const m = /^github:([^/]+)\/([^/]+?)(?:\.git)?$/.exec(String(target || ''))
+  if (!m) return null
+  return `https://codeload.github.com/${m[1]}/${m[2]}/tar.gz/HEAD`
 }
 
 /**
@@ -371,7 +432,7 @@ async function runProbe(explicitBin: string, source: string, allowBuilds?: reado
     // throwaway environment, so consent to the verified package's build here.
     const builds = Array.isArray(allowBuilds) ? allowBuilds.filter((k) => k && /^(@[a-z0-9-_.~]+\/)?[a-z0-9-_.~]+$/.test(k)) : []
     writeFileSync(join(profileDir_, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n'
-      + (builds.length > 0 ? '\nallowBuilds:\n' + builds.map((k) => `  ${k}: true`).join('\n') + '\n' : ''))
+      + (builds.length > 0 ? '\nallowBuilds:\n' + builds.map((k) => `  '${k}': true`).join('\n') + '\n' : ''))
     const env = { ...process.env, DSH_HOME: home, CI: 'true' }
     const runCwd = inv.cwd ?? profileDir_
 
@@ -437,19 +498,36 @@ function snapshotProfile(profile: string): string | null {
  * so the consent is scoped to exactly that verified package.
  */
 function ensureAllowBuilds(profile: string, key: string): void {
-  if (!key || !/^(@[a-z0-9-_.~]+\/)?[a-z0-9-_.~]+$/.test(key)) return
+  // pnpm keys are plain package names for git deps and `<name>@<tarball-url>`
+  // for tarball deps. Reject anything quote/newline-shaped (YAML injection).
+  if (!key || /['"\n\r]/.test(key)) return
+  if (!/^(@?[a-z0-9-_.~]+\/)*[a-z0-9-_.~]+(@https?:\/\/[^\s]+)?$/.test(key)) return
   const p = join(profileDir(profile), 'pnpm-workspace.yaml')
   if (!existsSync(p)) return
   const text = readFileSync(p, 'utf8')
   const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  if (new RegExp('^\\s*' + escapeRe(key) + '\\s*:\\s*true\\s*$', 'm').test(text)) return
+  // YAML reserves `@`, so a scoped package key must be single-quoted or the
+  // whole workspace file fails to parse (js-yaml "bad indentation").
+  if (new RegExp("^\\s*'?" + escapeRe(key) + "'?\\s*:\\s*true\\s*$", 'm').test(text)) return
+  const quoted = "'" + key + "'"
   const block = /^(\s*)allowBuilds\s*:.*$/m.exec(text)
   if (block !== null) {
     const ind = block[1] + '  '
-    writeFileSync(p, text.replace(/^(\s*)allowBuilds\s*:.*$/m, (line) => line + '\n' + ind + key + ': true'))
+    writeFileSync(p, text.replace(/^(\s*)allowBuilds\s*:.*$/m, (line) => line + '\n' + ind + quoted + ': true'))
   } else {
-    writeFileSync(p, text.replace(/\n+$/, '') + '\n\nallowBuilds:\n  ' + key + ': true\n')
+    writeFileSync(p, text.replace(/\n+$/, '') + '\n\nallowBuilds:\n  ' + quoted + ': true\n')
   }
+}
+
+/**
+ * The exact pnpm allowBuilds keys a dependency install may demand: the plain
+ * package name (git deps) plus `<name>@<tarball-url>` (tarball deps).
+ */
+function allowBuildKeys(pkgName: string | null | undefined, spec: string | null): string[] {
+  if (pkgName === null || pkgName === undefined || pkgName === '') return []
+  const keys = [pkgName]
+  if (spec !== null && spec !== undefined && /^https?:\/\//.test(spec)) keys.push(pkgName + '@' + spec)
+  return keys
 }
 
 // ── GitHub real-time search (topic:dsh-plugin) ───────────────────────────────
@@ -607,6 +685,59 @@ function hasWebClient(profile: string, packageName: string): boolean {
     const client = manifest.dsh && manifest.dsh.client
     return client !== undefined && client.platform === 'web'
   } catch { return false }
+}
+
+/** Whether an installed package declares a bundle patch layer (`dsh.bundle`). */
+function hasBundleManifest(profile: string, packageName: string): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(join(profileDir(profile), 'node_modules', packageName, 'package.json'), 'utf8'))
+    return manifest.dsh !== undefined && manifest.dsh.bundle !== undefined
+  } catch { return false }
+}
+
+/** Stable synthetic loader-row id for a client-only package. */
+function clientRowId(packageName: string): string {
+  return 'dsh-market-client-' + String(packageName).replace(/^@/, '').replace(/[^a-zA-Z0-9_-]/g, '-')
+}
+
+/**
+ * Append a synthetic `insert` row for a client-only package to the profile's
+ * cordis.patch.yml (idempotent). The modules node half scans Loader ENTRIES
+ * for `dsh.client` declarations, so a bundle-less client plugin needs this
+ * row to join the browser roster on the next restart.
+ */
+function ensureClientRow(profile: string, packageName: string): boolean {
+  const p = join(profileDir(profile), 'cordis.patch.yml')
+  if (!existsSync(p)) return false
+  const text = readFileSync(p, 'utf8')
+  if (text.includes("name: '" + packageName + "'") || text.includes('name: "' + packageName + '"')) return false
+  const entry = `- insert:\n    - id: ${clientRowId(packageName)}\n      name: '${packageName}'\n`
+  if (/^\s*\[\s*\]\s*$/m.test(text)) {
+    writeFileSync(p, entry)
+  } else {
+    writeFileSync(p, text.replace(/\s+$/, '') + '\n' + entry)
+  }
+  return true
+}
+
+/**
+ * Remove the synthetic loader row for a client-only package (idempotent). A
+ * row left behind after uninstall would point at a missing package and fail
+ * the next boot.
+ */
+function removeClientRow(profile: string, packageName: string): void {
+  const p = join(profileDir(profile), 'cordis.patch.yml')
+  if (!existsSync(p)) return
+  let text = readFileSync(p, 'utf8')
+  const block = `- insert:\n    - id: ${clientRowId(packageName)}\n      name: '${packageName}'\n`
+  if (!text.includes(block)) return
+  text = text.split(block).join('')
+  text = text.replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '')
+  if (text.trim() === '' || text.trim() === '[]') {
+    writeFileSync(p, '[]\n')
+  } else {
+    writeFileSync(p, text.replace(/\s+$/, '') + '\n')
+  }
 }
 
 /** FiberState.ACTIVE — Cordis's const enum value (no cross-package import here). */
@@ -875,7 +1006,7 @@ async function checkUpdates(profile: string): Promise<Record<string, any>> {
 const UPDATES_TTL_MS = 10 * 60 * 1000
 let updatesCache: Record<string, any> = {}
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, codeloadSpec, allowBuildKeys } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -951,7 +1082,9 @@ export function apply(ctx: any): void {
           if (activeOp && activeOp.status === 'running') {
             return sendJson(res, 200, { ok: false, busy: true, output: '已有任务进行中：' + activeOp.label })
           }
-          const target = spec.startsWith('github:') ? spec.replace(/#.*$/, '') : `${name}@latest`
+          const target = spec.startsWith('github:') ? spec.replace(/#.*$/, '')
+            : spec.startsWith('https://codeload.github.com/') ? spec.replace(/\/tar\.gz\/.+$/, '/tar.gz/HEAD')
+            : `${name}@latest`
           const label = String(body.label || name)
           updatesCache = { ...updatesCache, [profile]: null }
           const started = startOp('update', profile, target, label, String(body.binPath || '').trim(),
@@ -1014,12 +1147,17 @@ export function apply(ctx: any): void {
                     + '。如确需安装（风险自负），请勾选"跳过安全检查"。',
                 })
               }
+              // Direct git to github.com hangs on many networks (no proxy
+              // reach, git ignores some setups) while the codeload CDN stays
+              // reachable — install through the tarball URL instead of git.
+              const tarball = codeloadSpec(target)
+              const buildKeys = allowBuildKeys(cls.pkgName ?? null, tarball)
               if (!cls.webClient) {
                 // Bundle-only plugin: trial boot in a throwaway profile. The
                 // probe consents to the verified package's prepare script in
-                // its own throwaway workspace, so git installs pass pnpm's
+                // its own throwaway workspace, so tarball installs pass pnpm's
                 // build block there.
-                const verdict = await runProbe(bin, target, cls.pkgName !== null && cls.pkgName !== undefined ? [cls.pkgName] : [])
+                const verdict = await runProbe(bin, tarball ?? target, buildKeys)
                 if (!verdict.ok) {
                   const stage = verdict.stage === 'install'
                     ? '候选插件安装进试装环境失败'
@@ -1031,18 +1169,20 @@ export function apply(ctx: any): void {
                       + '\n\n如需强制安装（风险自负），请勾选"跳过安全检查"。',
                   })
                 }
-                // Real install stays a git spec: consent the build for exactly
-                // this verified package in the real profile too.
-                if (cls.pkgName !== null && cls.pkgName !== undefined) ensureAllowBuilds(profile, cls.pkgName)
+                // Consent the build for exactly this verified package in the
+                // real profile too, and install the tarball there.
+                for (const k of buildKeys) ensureAllowBuilds(profile, k)
+                if (tarball !== null) installSpec = tarball
               } else {
                 // Web-client plugin: prefer a registry-verified npm tarball
-                // (seconds, no prepare script); fall back to the GitHub source
-                // (then consent the verified package's build).
+                // (seconds, no prepare script); fall back to the codeload
+                // tarball (then consent the verified package's build).
                 const npm = await npmRegistrySpec(target, cls.pkgName ?? null)
                 if (npm !== null) {
                   installSpec = npm
-                } else if (cls.pkgName !== null && cls.pkgName !== undefined) {
-                  ensureAllowBuilds(profile, cls.pkgName)
+                } else {
+                  for (const k of buildKeys) ensureAllowBuilds(profile, k)
+                  if (tarball !== null) installSpec = tarball
                 }
               }
             }

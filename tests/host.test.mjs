@@ -145,6 +145,11 @@ check('npmRegistrySpec rejects invalid name without network', noNet === null, no
 const bogus = await mod.npmRegistrySpec('github:a/b', 'mkts-bogus-pkg-9f8e7d6c5b4a')
 check('npmRegistrySpec null for unpublished name', bogus === null, bogus)
 
+// --- codeloadSpec: git-hosted installs go through the CDN tarball ---
+check('codeloadSpec maps github: to tarball URL', mod.codeloadSpec('github:acme/plugin') === 'https://codeload.github.com/acme/plugin/tar.gz/HEAD', mod.codeloadSpec('github:acme/plugin'))
+check('codeloadSpec strips .git suffix', mod.codeloadSpec('github:acme/plugin.git') === 'https://codeload.github.com/acme/plugin/tar.gz/HEAD', mod.codeloadSpec('github:acme/plugin.git'))
+check('codeloadSpec null for non-github spec', mod.codeloadSpec('@scope/pkg') === null, mod.codeloadSpec('@scope/pkg'))
+
 // --- restart route: rejected unless same-origin AND direct loopback ---
 const restCross = await call({ method: 'restart' }, { origin: 'http://evil.example' })
 check('restart rejected cross-origin', restCross.ok === false && /untrusted/.test(restCross.error || ''), restCross)
@@ -286,14 +291,27 @@ writeFileSync(join(tprof, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinke
 mod.ensureAllowBuilds('web', '@acme/tool')
 mod.ensureAllowBuilds('web', '@acme/tool') // idempotent
 const wsText = readFileSync(join(tprof, 'pnpm-workspace.yaml'), 'utf8')
-check('ensureAllowBuilds adds key once', (wsText.match(/@acme\/tool: true/g) || []).length === 1, wsText)
+check('ensureAllowBuilds adds scoped key once (quoted)', (wsText.match(/'@acme\/tool': true/g) || []).length === 1, wsText)
+check('ensureAllowBuilds does not leave unquoted scoped key', wsText.indexOf('@acme/tool: true') === -1, wsText)
 mod.ensureAllowBuilds('web', 'second-tool')
 const wsText2 = readFileSync(join(tprof, 'pnpm-workspace.yaml'), 'utf8')
-check('ensureAllowBuilds appends under existing block', (wsText2.match(/@acme\/tool: true/g) || []).length === 1
-  && (wsText2.match(/second-tool: true/g) || []).length === 1, wsText2)
+check('ensureAllowBuilds appends under existing block', (wsText2.match(/'@acme\/tool': true/g) || []).length === 1
+  && (wsText2.match(/'second-tool': true/g) || []).length === 1, wsText2)
 mod.ensureAllowBuilds('web', 'not a valid key!')
 const wsText3 = readFileSync(join(tprof, 'pnpm-workspace.yaml'), 'utf8')
 check('ensureAllowBuilds rejects invalid key', wsText3 === wsText2, wsText3)
+
+// --- ensureClientRow: synthetic loader row for client-only packages ---
+writeFileSync(join(tprof, 'cordis.patch.yml'), '[]\n')
+mod.ensureClientRow('web', '@acme/ui-theme')
+mod.ensureClientRow('web', '@acme/ui-theme') // idempotent
+const patchText = readFileSync(join(tprof, 'cordis.patch.yml'), 'utf8')
+check('ensureClientRow writes synthetic insert row', (patchText.match(/- insert:/g) || []).length === 1
+  && patchText.includes("name: '@acme/ui-theme'"), patchText)
+mod.ensureClientRow('web', 'another-theme')
+const patchText2 = readFileSync(join(tprof, 'cordis.patch.yml'), 'utf8')
+check('ensureClientRow appends second row', (patchText2.match(/- insert:/g) || []).length === 2
+  && patchText2.includes("name: 'another-theme'"), patchText2)
 
 if (origHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = origHome
