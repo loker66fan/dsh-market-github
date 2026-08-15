@@ -233,18 +233,53 @@ function isLoopback(req: any): boolean {
 /** Non-null while a restart is already scheduled (a second one stacks never). */
 let restartTimer: ReturnType<typeof setTimeout> | null = null
 
+/** The listening port the new process must wait for (0 = unknown; no wait). */
+function restartPort(): number {
+  try {
+    const webServer = hotCtx && hotCtx.get('webServer')
+    const port = webServer && webServer.port
+    return typeof port === 'number' && port > 0 ? port : 0
+  } catch { return 0 }
+}
+
+/**
+ * Build the inline JS for the detached restart guard (see scheduleRestart).
+ * Values are injected via JSON.stringify, so no shell quoting hazards.
+ */
+function restartGuardScript(port: number, execPath: string, args: string[], cwd: string): string {
+  return [
+    'const net=require("node:net");',
+    'const PORT=' + port + ',EXEC=' + JSON.stringify(execPath) + ',ARGS=' + JSON.stringify(args) + ',CWD=' + JSON.stringify(cwd) + ';',
+    // A bind probe succeeding means the old process released the port.
+    'const tryBind=(cb)=>{const s=net.createServer();s.once("error",()=>cb(false));s.listen(PORT,"127.0.0.1",()=>{s.close(()=>cb(true))});};',
+    'const started=Date.now();',
+    'const poll=()=>{if(PORT<=0)return launch();tryBind((free)=>{if(free)return launch();if(Date.now()-started>15000)return launch();setTimeout(poll,100)})};',
+    'const launch=()=>{try{require("node:child_process").spawn(EXEC,ARGS,{cwd:CWD,detached:true,stdio:"ignore",windowsHide:true}).unref()}catch(e){}process.exit(0)};',
+    'poll();',
+  ].join('\n')
+}
+
 /**
  * Relaunch the exact dsh entry — same argv, execArgv, environment, and working
  * directory — as a detached replacement, then exit this process so the new one
  * can take the port. The route that calls this is restricted to same-origin
  * direct loopback requests; the exit delay is generous enough for the HTTP
  * response to flush first.
+ *
+ * Port race: the OLD process still holds the listen socket while it exits, so
+ * a replacement spawned immediately dies on EADDRINUSE and both are gone. The
+ * fix inverts the order: this process exits FIRST, and a tiny detached
+ * `node -e` guard waits for the port to be released (bind probe, ≤15s) before
+ * spawning the real dsh entry — the new process then binds a free port.
  */
 function scheduleRestart(): { ok: boolean; error?: string } {
   if (restartTimer !== null) return { ok: true }
   const args = [...process.execArgv, ...process.argv.slice(1)]
+  const guard = restartGuardScript(restartPort(), process.execPath, args, process.cwd())
   try {
-    const child = spawn(process.execPath, args, { cwd: process.cwd(), env: process.env, detached: true, stdio: 'ignore' })
+    const child = spawn(process.execPath, ['-e', guard], {
+      cwd: process.cwd(), env: process.env, detached: true, stdio: 'ignore', windowsHide: true,
+    })
     child.unref()
   } catch (e: any) {
     return { ok: false, error: '重启失败：' + String((e && e.message) || e) }
@@ -671,6 +706,25 @@ function mapGitHubItem(item: any): any {
 /** Server-side cache for GitHub search (short TTL to respect the rate limit). */
 const searchCache = new Map<string, { at: number; data: { plugins: any[]; total: number; rate?: { limit: string | null; remaining: string | null } } }>()
 const SEARCH_TTL_MS = 60 * 1000
+/** Upper bound on cached search pages; insertion-order eviction keeps it flat. */
+const SEARCH_CACHE_MAX = 200
+
+/**
+ * Evict expired entries (and then the oldest by insertion order) so the cache
+ * cannot grow without bound across distinct query permutations.
+ */
+function pruneSearchCache(): void {
+  if (searchCache.size <= SEARCH_CACHE_MAX) return
+  const now = Date.now()
+  for (const [k, v] of searchCache) {
+    if (now - v.at >= SEARCH_TTL_MS) searchCache.delete(k)
+  }
+  while (searchCache.size > SEARCH_CACHE_MAX) {
+    const oldest = searchCache.keys().next()
+    if (oldest.done) break
+    searchCache.delete(oldest.value)
+  }
+}
 
 /**
  * Assemble the GitHub search query: always the `dsh-plugin` topic, and never
@@ -729,6 +783,7 @@ async function searchGitHub(
       rate: { limit: res.headers.get('x-ratelimit-limit'), remaining: res.headers.get('x-ratelimit-remaining') },
     }
     searchCache.set(cacheKey, { at: Date.now(), data: result })
+    pruneSearchCache()
     return result
   } catch (e: any) {
     return { plugins: [], total: 0, error: 'GitHub 搜索失败：' + String((e && e.message) || e) }
@@ -906,19 +961,22 @@ async function hotMount(ctx: any, profile: string, packageName: string): Promise
     writeFileSync(file, yml)
     handle = ctx.plugin(HotTree, { path: pathToFileURL(file).href })
     await handle.await()
-    // Verify the mounted row actually activated: a row whose inject
+    // Verify the mounted rows actually activated: a row whose inject
     // dependencies cannot be met stays pending/failed and must never be
-    // reported as hot-mounted.
+    // reported as hot-mounted. Loader entries carry the patch ROW's module
+    // resolution name (entry.options.name), which is not necessarily the
+    // npm package name — match against every row name from the patch.
+    const names = new Set(rows.map((row) => row.name))
     const loader = ctx.get('loader')
     const deadline = Date.now() + 8000
     while (Date.now() < deadline) {
-      const entry = loader && [...loader.entries()].find((e: any) => e.options && e.options.name === packageName)
-      const state = entry && entry.fiber ? entry.fiber.state : undefined
-      if (state === FIBER_ACTIVE) {
+      const entries = loader ? [...loader.entries()].filter((e: any) => e.options && names.has(e.options.name)) : []
+      const states = entries.map((e: any) => (e.fiber ? e.fiber.state : undefined))
+      if (states.length > 0 && states.every((s: any) => s === FIBER_ACTIVE)) {
         hotHandles.set(packageName, handle)
         return true
       }
-      if (state === FIBER_FAILED) break
+      if (states.includes(FIBER_FAILED)) break
       await new Promise((r) => setTimeout(r, 250))
     }
     try { await handle.dispose() } catch {}
@@ -941,22 +999,38 @@ async function disposeHotMount(packageName: string): Promise<void> {
   }
 }
 
-async function disableLoaderEntry(packageName: string): Promise<void> {
+/**
+ * Loader entry names a package mounts as: the patch ROW names from its
+ * cordis.patch.yml (entry.options.name is the row's module resolution name,
+ * not necessarily the npm package name). Falls back to [packageName] when the
+ * patch is missing/unparseable — the pre-fork behavior.
+ */
+function loaderNamesFor(profile: string, packageName: string): string[] {
+  try {
+    const patchText = readFileSync(join(profileDir(profile), 'node_modules', packageName, 'cordis.patch.yml'), 'utf8')
+    const rows = parseSimplePatch(patchText)
+    if (rows !== null && rows.length > 0) return rows.map((row) => row.name)
+  } catch {}
+  return [packageName]
+}
+
+async function disableLoaderEntry(names: string[]): Promise<void> {
   const loader = hotCtx && hotCtx.get('loader')
   if (!loader) return
+  const wanted = new Set(names)
   let disabled = false
   for (const entry of loader.entries()) {
-    if (entry.options && entry.options.name === packageName && !entry.disabled) {
+    if (entry.options && wanted.has(entry.options.name) && !entry.disabled) {
       try {
         await entry.update({ disabled: true })
         disabled = true
       } catch (e: any) {
-        console.warn('[dsh-market] disable loader entry ' + packageName + ' failed: ' + String((e && e.message) || e))
+        console.warn('[dsh-market] disable loader entry ' + entry.options.name + ' failed: ' + String((e && e.message) || e))
       }
     }
   }
   if (disabled) {
-    console.log('[dsh-market] disabled loader entry ' + packageName + ' (disable)')
+    console.log('[dsh-market] disabled loader entry ' + names.join(', ') + ' (disable)')
   }
 }
 
@@ -1072,7 +1146,7 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
     } else {
       removeClientRow(profile, name)
       await withTimeout(disposeHotMount(name), 4000)
-      await withTimeout(disableLoaderEntry(name), 4000)
+      await withTimeout(disableLoaderEntry(loaderNamesFor(profile, name)), 4000)
     }
     return { ok: true, active: enabled, needsRestart: true, message: enabled ? 'enabled:restart' : 'disabled:restart' }
   }
@@ -1091,7 +1165,7 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
   if (!enabled) {
     // Stop serving immediately: dispose hot mount + disable loader entry.
     await withTimeout(disposeHotMount(name), 4000)
-    await withTimeout(disableLoaderEntry(name), 4000)
+    await withTimeout(disableLoaderEntry(loaderNamesFor(profile, name)), 4000)
   }
 
   // For enable, try live hot-mount (only makes sense if the package declares a
@@ -1123,6 +1197,13 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
 }
 
 async function checkUpdates(profile: string): Promise<Record<string, any>> {
+  // Expired entries are deleted in place (null = explicitly invalidated) so
+  // the per-profile map stays clean; a missing key and a null key are the same
+  // cache miss.
+  for (const k of Object.keys(updatesCache)) {
+    const v = updatesCache[k]
+    if (!v || Date.now() - v.at >= UPDATES_TTL_MS) delete updatesCache[k]
+  }
   const cached = updatesCache && updatesCache[profile]
   if (cached && Date.now() - cached.at < UPDATES_TTL_MS) return cached.data
   const installed = readProfileDeps(profile)
@@ -1524,7 +1605,10 @@ function registerMarketTools(ctx: any): void {
   console.log('[dsh-market] registered model tools: market_search, market_install, market_installed, market_update')
 }
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort } // test hooks
+/** Read-only view of the updates cache for tests (the live object identity). */
+function updatesCacheView(): Record<string, any> { return updatesCache }
+
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -1679,7 +1763,7 @@ export function apply(ctx: any): void {
           const label = String(body.label || target)
           if (method === 'uninstall') {
             await withTimeout(disposeHotMount(target), 4000)
-            await withTimeout(disableLoaderEntry(target), 4000)
+            await withTimeout(disableLoaderEntry(loaderNamesFor(profile, target)), 4000)
           }
           await waitProxyReady(2000)
           const started = startOp(method, profile, target, label, String(body.binPath || '').trim())

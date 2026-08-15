@@ -1,9 +1,11 @@
 // Local harness for lib/host.js: mounts the plugin against a fake webServer and
 // exercises the API surface + op pipeline with a fake CLI bin (no real profile
 // or network install is touched). Run: node --test tests/host.test.mjs
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createServer } from 'node:net'
+import { spawn } from 'node:child_process'
 const mod = await import('../lib/host.js')
 
 let handler = null
@@ -162,6 +164,41 @@ check('restart rejected cross-origin', restCross.ok === false && /untrusted/.tes
 const restNoLoop = await call({ method: 'restart' }) // fake req has no socket
 check('restart rejected without direct loopback socket', restNoLoop.ok === false && /loopback/.test(restNoLoop.error || ''), restNoLoop)
 
+// --- restart guard: syntax-valid inline JS, launches only once the port frees -
+// (The guard is the detached `node -e` script scheduleRestart leaves behind; it
+// polls the port with a bind probe, then spawns the recorded entry.)
+if (mod.restartGuardScript) {
+  const guard = mod.restartGuardScript(0, process.execPath, ['-e', ''], process.cwd())
+  check('restart guard script is non-empty inline JS', typeof guard === 'string' && guard.includes('net.createServer'), typeof guard)
+  // Run one live guard against a FREE port: its launch must spawn a child that
+  // writes a marker file, then the guard exits 0.
+  const marker = join(tmpdir(), 'mkts-guard-marker-' + process.pid + '.txt')
+  try { rmSync(marker, { force: true }) } catch {}
+  const server = await new Promise((resolve) => {
+    const s = createServer()
+    s.listen(0, '127.0.0.1', () => resolve(s))
+  })
+  const freePort = server.address().port
+  server.close()
+  const guardLive = mod.restartGuardScript(freePort, process.execPath,
+    ['-e', 'require("node:fs").writeFileSync(' + JSON.stringify(marker) + ', "ok")'], process.cwd())
+  const guardRun = spawn(process.execPath, ['-e', guardLive], { stdio: 'ignore' })
+  const guardExit = new Promise((resolve) => guardRun.on('exit', (code) => resolve(code)))
+  const markerOk = await new Promise((resolve) => {
+    const deadline = Date.now() + 15000
+    const poll = () => {
+      if (existsSync(marker)) return resolve(true)
+      if (Date.now() > deadline) return resolve(false)
+      setTimeout(poll, 100)
+    }
+    poll()
+  })
+  check('restart guard launches entry once port is free', markerOk === true, marker)
+  const guardCode = await Promise.race([guardExit, new Promise((r) => setTimeout(() => r('timeout'), 5000))])
+  check('restart guard exits after launch', guardCode === 0, guardCode)
+  try { rmSync(marker, { force: true }) } catch {}
+}
+
 // --- GitHub real-time search (mapGitHubItem unit + search route) ---
 const ghMapped = mod.mapGitHubItem({
   full_name: 'acme/awesome-plugin', html_url: 'https://github.com/acme/awesome-plugin',
@@ -177,6 +214,40 @@ if (!search.ok) skip('search (GitHub rate-limited or offline)')
 else {
   check('search returns plugins', Array.isArray(search.plugins) && search.plugins.length > 0, search)
   check('search cards carry github source', search.plugins.every((p) => typeof p.source === 'string' && p.source.startsWith('github:')), search.plugins[0])
+}
+
+// --- searchCache expiry pruning: expired entries die first, then oldest ---
+// Fill the cache directly (no network): 150 fresh + 60 expired entries, then
+// prune — the 60 expired must go, keeping size ≤ 200 without touching fresh.
+if (mod.searchCache && mod.pruneSearchCache) {
+  const cache = mod.searchCache
+  cache.clear()
+  const now = Date.now()
+  const ttl = 60 * 1000
+  for (let i = 0; i < 150; i++) cache.set('fresh-' + i, { at: now, data: { plugins: [], total: 0 } })
+  for (let i = 0; i < 60; i++) cache.set('old-' + i, { at: now - ttl - 1000, data: { plugins: [], total: 0 } })
+  mod.pruneSearchCache()
+  check('pruneSearchCache drops expired entries', !cache.has('old-0') && !cache.has('old-59'), cache.size)
+  check('pruneSearchCache keeps fresh entries under cap', cache.size <= 200 && cache.has('fresh-0') && cache.has('fresh-149'), cache.size)
+  // Over cap with all fresh: evict oldest by insertion order.
+  cache.clear()
+  for (let i = 0; i < 230; i++) cache.set('k-' + i, { at: now, data: { plugins: [], total: 0 } })
+  mod.pruneSearchCache()
+  check('pruneSearchCache evicts oldest when all fresh', cache.size <= 200 && !cache.has('k-0') && !cache.has('k-29') && cache.has('k-30') && cache.has('k-229'), cache.size)
+  cache.clear()
+}
+
+// --- updatesCache: expired/null entries are deleted in place on read ---
+{
+  const uc = mod.updatesCacheView && mod.updatesCacheView()
+  if (uc) {
+    uc['__aged__'] = { at: Date.now() - 11 * 60 * 1000, data: { stale: true } }
+    uc['__null__'] = null
+    await mod.checkUpdates('__no_such_profile__')
+    check('checkUpdates deletes expired/null cache entries', uc['__aged__'] === undefined && uc['__null__'] === undefined, uc)
+  } else {
+    check('updatesCacheView test hook exposed', false, 'no updatesCacheView export')
+  }
 }
 
 // --- parseSimplePatch: hot-mountable patch shape detection ---
@@ -318,6 +389,20 @@ mod.ensureClientRow('web', 'another-theme')
 const patchText2 = readFileSync(join(tprof, 'cordis.patch.yml'), 'utf8')
 check('ensureClientRow appends second row', (patchText2.match(/- insert:/g) || []).length === 2
   && patchText2.includes("name: 'another-theme'"), patchText2)
+
+// --- loaderNamesFor: patch row names, falling back to the package name ---
+// A package whose cordis.patch.yml rows resolve under names DIFFERENT from the
+// npm package name (the hot-mount verification / disable-entry case).
+mkdirSync(join(tprof, 'node_modules', 'row-pkg'), { recursive: true })
+writeFileSync(join(tprof, 'node_modules', 'row-pkg', 'package.json'), JSON.stringify({ name: 'row-pkg', version: '1.0.0' }) + '\n')
+writeFileSync(join(tprof, 'node_modules', 'row-pkg', 'cordis.patch.yml'),
+  '- insert:\n    - id: tool-csv\n      name: \'@acme/row-pkg-tool\'\n    - id: tool-x\n      name: \'@acme/row-pkg-x\'\n')
+const rowNames = mod.loaderNamesFor('web', 'row-pkg')
+check('loaderNamesFor returns patch row names', Array.isArray(rowNames) && rowNames.length === 2
+  && rowNames[0] === '@acme/row-pkg-tool' && rowNames[1] === '@acme/row-pkg-x', rowNames)
+// Missing package (no patch to read) → fallback to the package name itself.
+check('loaderNamesFor falls back to package name', mod.loaderNamesFor('web', 'no-such-pkg').length === 1
+  && mod.loaderNamesFor('web', 'no-such-pkg')[0] === 'no-such-pkg', mod.loaderNamesFor('web', 'no-such-pkg'))
 
 if (origHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = origHome
