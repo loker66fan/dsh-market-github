@@ -12,7 +12,7 @@
 //    the fix for "the modal disappears and stops showing the download".
 // The op bus state itself is module-level and resumed at apply time, so a
 // refresh or tab switch never loses an in-flight op.
-import { createElement as h, Fragment, useEffect, useState } from 'react'
+import { createElement as h, Fragment, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only contributions: pull the settings SlotMap merge (so
@@ -46,21 +46,30 @@ const STR: Record<string, Record<string, string>> = {
     updateFail: '更新检测失败', updLocal: '本地链接',
     running: '执行中…（pnpm 安装可能需要一段时间）',
     cmdLabel: '安装命令（来自官网，含目标 profile）:', noCmd: '（无官方安装命令）',
-    hint: '安装后需重启 Web 服务生效；GitHub 源会执行包内 prepare 脚本（pnpm allowBuilds 需放行）。安装进 web 前会做两层安全把关：① 只允许安装精选目录收录的源；② 试装验证——在临时环境实际启动一次，确认 web 能正常启动才写入真实 profile。验证失败会给出真实启动错误且不改动现有安装；简单插件装好后会自动热挂载（无需重启）。确实需要强制安装时可勾选"跳过安全检查"（风险自负）。',
+    hint: '安装后需重启 Web 服务生效；GitHub 源会执行包内 prepare 脚本（pnpm allowBuilds 需放行）。装进 web 前会自动把关：① 读取该仓库的 dsh 清单（声明 dsh.client 的 web 插件直接安装，仅声明 bundle 的走临时环境试装启动验证）；② 验证失败会给出真实错误且不改动现有安装。简单插件装好后会自动热挂载（无需重启）。确实需要强制安装时可勾选"跳过安全检查"（风险自负）。',
     gh: 'GitHub ↗', envLine: '环境', parseFail: '解析失败', fetchFail: '抓取失败',
     submit: '提交任务…', probing: '试装验证中…（临时环境实际启动验证 web 可正常启动后才安装，约 1~6 分钟）', min: '最小化到后台', kill: '终止任务', back: '返回',
     stDone: '完成', stFailed: '失败', stKilled: '已终止', stTimeout: '超时终止',
     stBusy: '已有任务进行中', stRefused: '已拒绝', liveChip: '插件任务',
     elapsed: '已耗时 {s}s（超过 {t}s 自动终止）', newOp: '新任务',
-    site: '插件目录来源',
+    site: '插件来源',
+    sourceNote: '结果实时来自 GitHub topic:dsh-plugin，未经人工审核；请自行确认插件可信后再安装。',
     sortDefault: '默认', sortHot: '最热', sortNew: '最新',
     enable: '启用', disable: '停用', active: '已启用', inactive: '已停用',
     activeLive: '已启用（热挂载生效）', inactiveLive: '已停用（立即生效）',
     toggling: '切换中…',
     progRunning: '安装进行中', progDone: '安装完成', progErr: '安装失败',
     restartBanner: '插件状态已变更，重启 Web 服务后生效', restartHint: '重启后生效',
+    restartNow: '立即重启', restarting: '重启中…',
     progMetaCmd: '{kind} {label} · {s}s',
     noActive: '未安装',
+    marketTitle: '插件商城',
+    marketSubtitle: '搜索并安装 GitHub 上的 dsh 社区插件',
+    done: '完成 / 跳过',
+    searching: '搜索 GitHub…',
+    prev: '上一页',
+    next: '下一页',
+    totalResults: '共 {n} 个',
   },
   en: {
     search: 'Search plugins…', all: 'All', instFilter: 'Installed', detail: 'Details', collapse: 'Collapse',
@@ -73,21 +82,30 @@ const STR: Record<string, Record<string, string>> = {
     updateFail: 'Update check failed', updLocal: 'linked (dev)',
     running: 'Running… (pnpm install may take a while)',
     cmdLabel: 'Install command (from the site, incl. target profile):', noCmd: '(no official install command)',
-    hint: 'Restart the web server after install. GitHub sources run the package prepare script (pnpm allowBuilds). Installing into web is gated twice: ① only sources from the curated catalog are accepted; ② a trial boot installs the plugin into a throwaway environment and starts it once — only a clean boot (the dsh web: readiness line) allows the install, and on failure the real boot error is shown with nothing modified. Simple plugins are hot-mounted after install (no restart). To force-install anyway, tick "skip safety checks" (at your own risk).',
+    hint: 'Restart the web server after install. GitHub sources run the package prepare script (pnpm allowBuilds). Installing into web is gated: ① the repo\'s dsh manifest is read (a plugin declaring dsh.client installs directly; a bundle-only plugin goes through a trial boot in a throwaway environment); ② a failed verification shows the real error and leaves the current install untouched. Simple plugins are hot-mounted after install (no restart). To force-install anyway, tick "skip safety checks" (at your own risk).',
     gh: 'GitHub ↗', envLine: 'Env', parseFail: 'Parse failed', fetchFail: 'Fetch failed',
     submit: 'Submitting…', probing: 'Trial-boot verifying… (installing into a throwaway env and starting it once to prove web still boots; ~1-6 min)', min: 'Minimize to background', kill: 'Kill task', back: 'Back',
     stDone: 'Done', stFailed: 'Failed', stKilled: 'Killed', stTimeout: 'Timed out',
     stBusy: 'A task is already running', stRefused: 'Refused', liveChip: 'Plugin task',
     elapsed: '{s}s elapsed (auto-kill after {t}s)', newOp: 'New task',
-    site: 'Plugin directory source',
+    site: 'Plugin source',
+    sourceNote: 'Results come live from GitHub topic:dsh-plugin (unreviewed) — verify a plugin yourself before installing.',
     sortDefault: 'Default', sortHot: 'Top', sortNew: 'New',
     enable: 'Enable', disable: 'Disable', active: 'Active', inactive: 'Inactive',
     activeLive: 'Enabled (hot-mounted)', inactiveLive: 'Disabled (live)',
     toggling: 'Switching…',
     progRunning: 'Install in progress', progDone: 'Install done', progErr: 'Install failed',
     restartBanner: 'Plugin state changed — restart the web server to activate', restartHint: 'Restart required',
+    restartNow: 'Restart now', restarting: 'Restarting…',
     progMetaCmd: '{kind} {label} · {s}s',
     noActive: 'Not installed',
+    marketTitle: 'Plugin Market',
+    marketSubtitle: 'Search and install community dsh plugins from GitHub',
+    done: 'Done / Skip',
+    searching: 'Searching GitHub…',
+    prev: 'Prev',
+    next: 'Next',
+    totalResults: '{n} total',
   },
 }
 const t = (k: string): string => { const m = STR[LOCALE]; return (m && m[k] !== undefined) ? m[k] : (STR['zh'][k] !== undefined ? STR['zh'][k] : k) }
@@ -148,9 +166,23 @@ function actClass(plugin: any, installed: any, active: boolean): string {
 
 // ── GlobalProgress: frame-wide shell.overlay indicator ───────────────────────
 // Stays mounted app-wide, so an op's progress (and its kill button) are never
-// lost by navigating to another project/section. Also shows a restart banner.
+// lost by navigating to another project/section. Also shows a restart banner
+// with a one-click restart that polls until the replacement server answers.
+let reloadAttempts = 0
+
+/** Poll the origin until the restarted server answers, then reload the page. */
+function pollReload(): void {
+  reloadAttempts += 1
+  if (reloadAttempts > 60) { reloadAttempts = 0; return } // give up after ~2 min
+  fetch(window.location.origin + '/', { cache: 'no-store' }).then((r) => {
+    if (r.ok) { try { location.reload() } catch {} }
+    else setTimeout(pollReload, 2000)
+  }).catch(() => { setTimeout(pollReload, 2000) })
+}
+
 function GlobalProgress(): ReactNode {
   const [, force] = useState(0)
+  const [restarting, setRestarting] = useState(false)
   useEffect(() => subscribeOp(() => force((n) => n + 1)), [])
   const op = getOp()
   if (!op || op.phase === 'confirm') return null
@@ -175,11 +207,21 @@ function GlobalProgress(): ReactNode {
   // Restart banner: successful install/update that was NOT hot-mounted.
   const needRestart = op.phase === 'done' && op.ok && op.hot !== true && op.kind !== 'uninstall'
 
+  const requestRestart = (): void => {
+    if (restarting) return
+    setRestarting(true)
+    apiOp('restart').then((r) => {
+      if (r && r.ok) { pollReload(); return }
+      setRestarting(false)
+    }).catch(() => { setRestarting(false) })
+  }
+
   return h('div', { className: 'mkts mkts-prog' },
     needRestart
       ? h('div', { className: 'mkts-restart' },
           h('span', { style: { flex: 1 } }, t('restartBanner')),
-          h('span', { style: { fontSize: 11, color: 'var(--dsw-static-deepseek-500)' } }, t('restartHint')),
+          h('button', { className: 'mkts-restart-btn', disabled: restarting, onClick: requestRestart },
+            restarting ? t('restarting') : t('restartNow')),
         )
       : null,
     h('div', { className: 'mkts-prog-bar ' + colored, onClick: running ? minimizeOp : closeOpState, title },
@@ -207,9 +249,9 @@ function MarketPanel(): ReactNode {
   const [envInfo, setEnvInfo] = useState<any>(null)
   const [binPath, setBinPath] = useState<string>((() => { try { return localStorage.getItem('mktsBin') || '' } catch { return '' } })())
   const [query, setQuery] = useState('')
-  const [cat, setCat] = useState('all')
   const [showInstalled, setShowInstalled] = useState(false)
-  const [sortBy, setSortBy] = useState('default')
+  const [sortBy, setSortBy] = useState('stars')
+  const [page, setPage] = useState(1)
   const [open, setOpen] = useState<string | null>(null)
   const [, force] = useState(0)
   const op = getOp()
@@ -238,20 +280,59 @@ function MarketPanel(): ReactNode {
 
   useEffect(() => { probe() }, [])
 
-  useEffect(() => {
-    let alive = true
-    setData((d: any) => ({ ...d, phase: 'loading', error: null }))
-    const finish = (r: any) => {
-      if (!alive || !r || !r.ok) throw new Error((r && r.error) || 'empty')
-      setData((d: any) => ({ ...d, phase: 'ready', plugins: r.plugins || [], cats: r.cats || [] }))
-      loadInstalled(r.plugins || [])
-    }
-    apiOp('list', { lang: LOCALE }).then(finish).catch((e) => {
-      if (!alive) return
-      setData((d: any) => ({ ...d, phase: 'error', error: t('fetchFail') + ': ' + String((e && e.message) || e) }))
+  const PER_PAGE = 50 // items per page
+  const MAX_RESULTS = 1000 // GitHub search API caps pagination at 1000 total results
+  // Monotonic request id: only the latest search may write results (a slow
+  // earlier response must not overwrite the newer one).
+  const searchSeq = useRef(0)
+
+  // Number of available pages for a GitHub total (capped at 1000 results).
+  const pageCount = (total: number): number => Math.max(1, Math.ceil(Math.min(total, MAX_RESULTS) / PER_PAGE))
+
+  // Failure message that keeps an already-loaded list visible (rate limits and
+  // network errors show as a notice instead of blanking the page).
+  const failNotice = (message: string): void => {
+    setData((d: any) => (d.phase === 'ready' ? { ...d, notice: message } : { ...d, phase: 'error', error: message }))
+  }
+
+  // One search request for a page (replaces the list).
+  const runSearch = (q: string, sort: string, pageNum: number): void => {
+    const sortParam = sort === 'updated' ? 'updated' : 'stars'
+    const seq = ++searchSeq.current
+    apiOp('search', { q, sort: sortParam, order: 'desc', perPage: PER_PAGE, page: pageNum }).then((r) => {
+      if (seq !== searchSeq.current) return // stale response
+      if (!r || !r.ok) {
+        failNotice(String((r && r.error) || 'search failed'))
+        return
+      }
+      const plugins = r.plugins || []
+      setData((d: any) => ({ ...d, phase: 'ready', notice: null, plugins, cats: [], total: typeof r.total === 'number' ? r.total : null }))
+      loadInstalled(plugins)
+    }).catch((e) => {
+      if (seq !== searchSeq.current) return // stale failure
+      failNotice(t('fetchFail') + ': ' + String((e && e.message) || e))
     })
-    return () => { alive = false }
-  }, [])
+  }
+
+  // Real-time GitHub search (server-side, debounced). Empty query returns the
+  // topic's most-starred repositories; typing narrows the query after a short
+  // debounce so each keystroke does not burn the unauthenticated rate limit.
+  useEffect(() => {
+    setPage(1)
+    const timer = setTimeout(() => {
+      setData((d: any) => ({ ...d, phase: 'loading', error: null }))
+      runSearch(query, sortBy, 1)
+    }, query.trim() === '' ? 0 : 350)
+    return () => { clearTimeout(timer) }
+  }, [query, sortBy])
+
+  // Turn to a specific page (1-based), clamped to the available range.
+  const goPage = (n: number): void => {
+    const total = typeof data.total === 'number' ? data.total : (data.plugins || []).length
+    if (n < 1 || n > pageCount(total) || n === page) return
+    setPage(n)
+    runSearch(query, sortBy, n)
+  }
 
   // Refresh installed/active state when an op settles (install/update/uninstall/
   // enable-disable change the profile).
@@ -276,32 +357,23 @@ function MarketPanel(): ReactNode {
   }
   const [toggling, setToggling] = useState<string | null>(null)
 
+  // The server already scopes results to the query + sort; the client only
+  // applies the "installed" filter locally (and keeps the server order).
   const filtered = (data.plugins || []).filter((p: any) => {
-    if (cat !== 'all' && p.cat !== cat) return false
     if (showInstalled && !isInstalled(p, data.installed)) return false
-    const q = query.trim().toLowerCase()
-    if (q && !((p.name || '').toLowerCase().includes(q) || (p.desc || '').toLowerCase().includes(q) || (p.by || '').toLowerCase().includes(q))) return false
     return true
   })
 
   const installedCount = (data.plugins || []).filter((p: any) => isInstalled(p, data.installed)).length
 
-  const sorted = sortBy === 'hot'
-    ? [...filtered].sort((a: any, b: any) => (b.stars ?? -1) - (a.stars ?? -1))
-    : sortBy === 'new'
-      ? [...filtered].sort((a: any, b: any) => String(b.added || '').localeCompare(String(a.added || '')))
-      : filtered
+  const sorted = sortBy === 'updated'
+    ? [...filtered].sort((a: any, b: any) => String(b.added || '').localeCompare(String(a.added || '')))
+    : filtered
 
-  let groups: { id: string; label: string | null; items: any[] }[] = []
-  if (cat === 'all' && !showInstalled) {
-    for (const c of data.cats || []) {
-      if (c.id === 'all') continue
-      const items = sorted.filter((p: any) => p.cat === c.id)
-      if (items.length > 0) groups.push({ id: c.id, label: c.label, items })
-    }
-  } else {
-    groups.push({ id: 'sel', label: null, items: sorted })
-  }
+  const groups: { id: string; label: string | null; items: any[] }[] = [{ id: 'all', label: null, items: sorted }]
+
+  const totalCount = typeof data.total === 'number' ? data.total : (data.plugins || []).length
+  const totalPages = pageCount(totalCount)
 
   const binOk = envInfo && (envInfo.dshBin || (envInfo.binProvided && envInfo.binValid))
   const envReady = envInfo && binOk && envInfo.node && envInfo.dshHome
@@ -374,6 +446,7 @@ function MarketPanel(): ReactNode {
 
   return h('div', { className: 'mkts' },
     toast ? h('div', { className: 'mkts-err' }, toast) : null,
+    data.notice ? h('div', { className: 'mkts-notice' }, data.notice) : null,
     envInfo ? h('div', { className: 'mkts-env' + (envReady ? '' : ' mkts-env-bad') },
       t('envLine') + ': DSH_HOME ' + (envInfo.dshHome ? '✓ ' + envInfo.dshHome : '✗') + ' · node ' + (envInfo.node ? '✓' : '✗') + ' · dsh ' + (binOk ? '✓' : '✗') +
       ((!envInfo.dshBin && !(envInfo.binProvided && envInfo.binValid)) ? ' — dsh CLI 未定位' : ''),
@@ -384,29 +457,25 @@ function MarketPanel(): ReactNode {
     ),
     h('div', { className: 'mkts-site' },
       h('span', null, t('site') + ': '),
-      h('a', { href: LOCALE === 'zh' ? 'https://awesome-dsh-plugin.com/zh/' : 'https://awesome-dsh-plugin.com/', target: '_blank', rel: 'noopener noreferrer' },
-        LOCALE === 'zh' ? 'https://awesome-dsh-plugin.com/zh/' : 'https://awesome-dsh-plugin.com/'),
+      h('a', { href: 'https://github.com/topics/dsh-plugin', target: '_blank', rel: 'noopener noreferrer' },
+        'github.com/topics/dsh-plugin'),
       h('span', null, ' ↗'),
     ),
+    h('div', { className: 'mkts-source-note' }, t('sourceNote')),
     modal,
     h('div', { className: 'mkts-finder' },
       h('div', { className: 'mkts-row1' },
         h('input', { className: 'mkts-search', placeholder: t('search'), value: query, onChange: (e) => setQuery(e.target.value) }),
         liveChip,
-        h('span', { className: 'mkts-count' }, filtered.length + ' / ' + (data.plugins || []).length),
+        h('span', { className: 'mkts-count' }, showInstalled ? (filtered.length + ' ' + t('instFilter')) : fmt('totalResults', { n: totalCount })),
       ),
       h('div', { className: 'mkts-chips' },
-        (data.cats || []).map((c: any) => h('button', {
-          key: c.id,
-          className: 'mkts-chip' + (cat === c.id && !showInstalled ? ' mkts-chip-on' : ''),
-          onClick: () => { setCat(c.id); setShowInstalled(false) },
-        }, (c.id === 'all' ? t('all') : c.label), ' ', h('small', null, c.count))),
         h('button', {
           className: 'mkts-chip' + (showInstalled ? ' mkts-chip-on' : ''),
-          onClick: () => { setShowInstalled(!showInstalled); setCat('all') },
+          onClick: () => { setShowInstalled(!showInstalled) },
         }, t('instFilter'), ' ', h('small', null, installedCount)),
         h('div', { className: 'mkts-sort' },
-          [['default', t('sortDefault')], ['hot', t('sortHot')], ['new', t('sortNew')]].map(([key, label]) =>
+          [['stars', t('sortHot')], ['updated', t('sortNew')]].map(([key, label]) =>
             h('button', { key, className: sortBy === key ? 'on' : '', onClick: () => setSortBy(key) }, label))),
       ),
     ),
@@ -467,7 +536,34 @@ function MarketPanel(): ReactNode {
         )
       }),
     )) : null,
+    data.phase === 'ready' && totalPages > 1 ? h('div', { className: 'mkts-pager' },
+      h('button', { className: 'mkts-cmdbtn', disabled: page <= 1, onClick: () => goPage(page - 1) }, t('prev')),
+      h('span', { className: 'mkts-pager-info' }, page + ' / ' + totalPages),
+      h('button', { className: 'mkts-cmdbtn', disabled: page >= totalPages, onClick: () => goPage(page + 1) }, t('next')),
+    ) : null,
     data.phase === 'ready' && filtered.length === 0 ? h('div', { className: 'mkts-hint' }, t('noMatch')) : null,
+  )
+}
+
+// ── MarketOnboarding: the startup onboarding entry ────────────────────────────
+// The `settings.onboarding` slot mounts one ordered step at a time; a step owns
+// its visible chrome and hands control back via the owner's `complete`. This
+// step wraps the same MarketPanel in a full-screen modal so a fresh user meets
+// the market during first run (before any session exists), with a Done/Skip
+// action that never blocks onboarding.
+function MarketOnboarding(props: { complete?: () => void }): ReactNode {
+  return h('div', { className: 'mkts-ob' },
+    h('div', { className: 'mkts-ob-scrim', onClick: () => { if (props.complete) props.complete() } }),
+    h('div', { className: 'mkts-ob-card', onClick: (e: MouseEvent) => e.stopPropagation() },
+      h('div', { className: 'mkts-ob-header' },
+        h('div', { className: 'mkts-ob-title' },
+          h('h2', null, t('marketTitle')),
+          h('p', null, t('marketSubtitle')),
+        ),
+        h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-primary', onClick: () => { if (props.complete) props.complete() } }, t('done')),
+      ),
+      h('div', { className: 'mkts-ob-body' }, h(MarketPanel)),
+    ),
   )
 }
 
@@ -504,6 +600,12 @@ export function apply(ctx: ClientContext): void {
     MarketPanel,
   ))
 
+  // The startup onboarding step (first-run plugin market on the launch page).
+  slots.inject('settings.onboarding', () => slots.register(
+    { name: 'settings.onboarding', id: 'plugin-market', order: 10 },
+    MarketOnboarding,
+  ))
+
   // The frame-wide, never-lost install progress indicator.
   slots.inject('shell.overlay', () => slots.register(
     { name: 'shell.overlay', id: 'market-progress', order: -50 },
@@ -511,4 +613,4 @@ export function apply(ctx: ClientContext): void {
   ))
 }
 
-export { GlobalProgress, MarketPanel }
+export { GlobalProgress, MarketPanel, MarketOnboarding }

@@ -3,8 +3,7 @@
 // or network install is touched). Run: node --test tests/host.test.mjs
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 const mod = await import('../lib/host.js')
 
 let handler = null
@@ -62,14 +61,6 @@ check('installed shape', inst.ok && Array.isArray(inst.bundles) && typeof inst.d
 const emptyOp = await call({ method: 'op' })
 check('op empty -> null', emptyOp.ok && emptyOp.op === null, emptyOp)
 
-const list = await call({ method: 'list', lang: 'zh' })
-if (!list.ok) skip('list zh (real site)')
-else {
-  check('list zh (real site)', Array.isArray(list.plugins) && list.plugins.length >= 90, JSON.stringify(list).slice(0, 160))
-  const starCount = list.plugins.filter((p) => typeof p.stars === 'number').length
-  check('list zh includes star counts', starCount > 0, 'plugins=' + list.plugins.length + ' withStars=' + starCount)
-}
-
 // --- classify (read-only GitHub manifest fetches; skipped when offline) ---
 const tianshu = await mod.classifyPlugin('github:huiliyi37/dsh-tianshu-tui')
 if (tianshu.fetchFailed) skip('classify tianshu-tui webClient false')
@@ -124,89 +115,49 @@ check('install rejected cross-origin', crossOrigin.ok === false && /untrusted/.t
 const crossKill = await call({ method: 'kill' }, { origin: 'http://evil.example' })
 check('kill rejected cross-origin', crossKill.ok === false && /untrusted/.test(crossKill.error || ''), crossKill)
 
-// --- source whitelist (curated catalog only) ---
-const notListed = await call({ method: 'install', source: 'github:somebody/not-in-catalog', profile: 'web', binPath: process.execPath })
-check('install rejected when not in curated catalog', notListed.ok === false && notListed.refused === true && /精选目录/.test(notListed.output || ''), notListed)
+// --- install safety gate (GitHub sources verified via their dsh manifest) ---
+// A github: source whose package.json cannot be read (nonexistent repo or
+// offline) is refused before any profile write.
+const unverifiable = await call({ method: 'install', source: 'github:somebody/not-in-catalog', profile: 'web', binPath: process.execPath })
+check('install rejected when GitHub source cannot be verified', unverifiable.ok === false && unverifiable.refused === true && /无法验证/.test(unverifiable.output || ''), unverifiable)
 
-// A github: source that IS in the catalog passes the whitelist (then the probe
-// path would run; skipCheck bypasses to keep this fast and offline-safe).
+// A github: source that would pass the gate starts the op path directly when
+// skipCheck bypasses verification (fake bin exits 0; keep this offline-safe).
 const wlBin = join(tmpdir(), 'mkts-wl-bin-' + process.pid + '.mjs')
 writeFileSync(wlBin, `process.exit(0)\n`)
 const listedOk = await call({ method: 'install', source: 'github:huiliyi37/dsh-tianshu-tui', profile: 'web', binPath: wlBin, skipCheck: true })
-check('catalog-listed github source passes whitelist', listedOk.ok === true && listedOk.opId, listedOk)
+check('skipCheck bypasses verification and starts op', listedOk.ok === true && listedOk.opId, listedOk)
 await call({ method: 'kill' }) // cancel the started op
 
-// whitelistSource unit-level: registry/link specs are not gated.
-const wl = await mod.whitelistSource('@some/pkg', [{ source: 'github:a/b' }])
-check('whitelist ignores registry spec', wl.allowed === true, wl)
+// --- buildSearchQuery: topic + noise filters + user terms ---
+const bq = mod.buildSearchQuery('')
+check('buildSearchQuery always has topic + noise filters', /topic:dsh-plugin/.test(bq)
+  && /is:public/.test(bq) && /fork:false/.test(bq) && /archived:false/.test(bq), bq)
+const bqTerm = mod.buildSearchQuery('terminal')
+check('buildSearchQuery appends user terms', /terminal/.test(bqTerm) && bqTerm.startsWith('topic:dsh-plugin '), bqTerm)
 
-// --- catalog snapshot fallback (bundled data/catalog-snapshot.json) ---
-const snap = JSON.parse(readFileSync(join(dirname(fileURLToPath(new URL('../lib/host.js', import.meta.url))), '..', 'data', 'catalog-snapshot.json'), 'utf8'))
-check('snapshot exists and non-empty', Array.isArray(snap.plugins) && snap.plugins.length > 0 && Array.isArray(snap.cats), snap.updated)
+// --- restart route: rejected unless same-origin AND direct loopback ---
+const restCross = await call({ method: 'restart' }, { origin: 'http://evil.example' })
+check('restart rejected cross-origin', restCross.ok === false && /untrusted/.test(restCross.error || ''), restCross)
+const restNoLoop = await call({ method: 'restart' }) // fake req has no socket
+check('restart rejected without direct loopback socket', restNoLoop.ok === false && /loopback/.test(restNoLoop.error || ''), restNoLoop)
 
-// --- parseSite: stars extraction + owner/repo title split (new site layout) ---
-const siteHtml = `
-<ol class="dex">
-  <li class="item" data-cat="ui" style="animation-delay:0.02s">
-    <span class="no" aria-hidden="true">№ 01</span>
-    <div>
-      <h3><a href="https://github.com/huiliyi37/dsh-tianshu-tui" rel="noopener" translate="no">huiliyi37/dsh-tianshu-tui</a><span class="stars" translate="no">★ 1,234</span></h3>
-      <p>DeepSeek Harness 的终端 UI（TUI）。</p>
-    </div>
-    <button class="copy" type="button" data-cmd="dsh plugin --profile web add github:huiliyi37/dsh-tianshu-tui">复制安装命令</button>
-  </li>
-  <li class="item" data-cat="ui">
-    <span class="no" aria-hidden="true">№ 02</span>
-    <div>
-      <h3><a href="https://github.com/Noob-stupid/dsh-plugin-hub" rel="noopener" translate="no">Noob-stupid/dsh-plugin-hub</a></h3>
-      <p>插件管理面板。</p>
-    </div>
-    <button class="copy" type="button" data-cmd="dsh plugin --profile web add github:Noob-stupid/dsh-plugin-hub">复制安装命令</button>
-  </li>
-</ol>
-<button class="chip active" type="button" data-cat="all">全部 <small>2</small></button>
-<button class="chip" type="button" data-cat="ui">UI 增强 <small>2</small></button>
-`
-const parsedSite = mod.parseSite(siteHtml)
-check('parseSite splits owner/repo title + stars', parsedSite.plugins.length === 2
-  && parsedSite.plugins[0].name === 'dsh-tianshu-tui' && parsedSite.plugins[0].by === 'huiliyi37'
-  && parsedSite.plugins[0].stars === 1234 && parsedSite.plugins[0].source === 'github:huiliyi37/dsh-tianshu-tui',
-  parsedSite.plugins[0])
-check('parseSite null stars when absent', parsedSite.plugins[1].stars === null
-  && parsedSite.plugins[1].name === 'dsh-plugin-hub' && parsedSite.plugins[1].by === 'Noob-stupid', parsedSite.plugins[1])
-check('parseSite cats', parsedSite.cats.length === 2 && parsedSite.cats[0].id === 'all' && parsedSite.cats[0].count === 2, parsedSite.cats)
+// --- GitHub real-time search (mapGitHubItem unit + search route) ---
+const ghMapped = mod.mapGitHubItem({
+  full_name: 'acme/awesome-plugin', html_url: 'https://github.com/acme/awesome-plugin',
+  owner: { login: 'acme' }, description: 'A test plugin', stargazers_count: 42,
+  pushed_at: '2026-01-02T03:04:05Z', topics: ['dsh-plugin'],
+})
+check('mapGitHubItem maps to card shape', ghMapped.name === 'awesome-plugin' && ghMapped.by === 'acme'
+  && ghMapped.source === 'github:acme/awesome-plugin' && ghMapped.stars === 42
+  && ghMapped.url === 'https://github.com/acme/awesome-plugin', ghMapped)
 
-// --- registryToCatalog: plugins.json -> card shape (stars/added/owner) ---
-const regFixture = {
-  categories: {
-    ui: { en: 'UI Enhancements', zh: 'UI 增强' },
-    theme: { en: 'Themes', zh: '主题' },
-  },
-  plugins: [
-    {
-      name: 'dsh-tianshu-tui', owner: 'huiliyi37', url: 'https://github.com/huiliyi37/dsh-tianshu-tui',
-      category: 'ui', description: { en: 'TUI', zh: '终端 UI' }, stars: 110, added: '2026-08-13',
-      install: 'dsh plugin --profile web add github:huiliyi37/dsh-tianshu-tui',
-    },
-    {
-      name: 'dsh-whale', owner: 'vlln', url: 'https://github.com/vlln/whale-girl',
-      category: 'theme', description: { en: 'Whale', zh: '鲸鱼' }, stars: null, added: '2026-08-14',
-      install: 'dsh plugin --profile web add @scope/pkg',
-    },
-  ],
+const search = await call({ method: 'search', q: '', sort: 'stars', perPage: 5 })
+if (!search.ok) skip('search (GitHub rate-limited or offline)')
+else {
+  check('search returns plugins', Array.isArray(search.plugins) && search.plugins.length > 0, search)
+  check('search cards carry github source', search.plugins.every((p) => typeof p.source === 'string' && p.source.startsWith('github:')), search.plugins[0])
 }
-const mapped = mod.registryToCatalog(regFixture, 'zh')
-check('registryToCatalog maps stars/added/owner', mapped.plugins.length === 2
-  && mapped.plugins[0].stars === 110 && mapped.plugins[0].added === '2026-08-13'
-  && mapped.plugins[0].by === 'huiliyi37' && mapped.plugins[0].desc === '终端 UI', mapped.plugins[0])
-check('registryToCatalog keeps null stars + registry source', mapped.plugins[1].stars === null
-  && mapped.plugins[1].source === '@scope/pkg' && mapped.plugins[1].profile === 'web', mapped.plugins[1])
-check('registryToCatalog cats (all + per category)', mapped.cats.length === 3
-  && mapped.cats[0].id === 'all' && mapped.cats[0].count === 2
-  && mapped.cats[1].label === 'UI 增强' && mapped.cats[1].count === 1, mapped.cats)
-const mappedEn = mod.registryToCatalog(regFixture, 'en')
-check('registryToCatalog localizes desc/labels', mappedEn.plugins[0].desc === 'TUI'
-  && mappedEn.cats[0].label === 'All' && mappedEn.cats[1].label === 'UI Enhancements', mappedEn.cats[1])
 
 // --- parseSimplePatch: hot-mountable patch shape detection ---
 const simplePatch = mod.parseSimplePatch('- insert:\n    - id: tool-csv\n      name: \'@deepseek-ai/dsh-tool-csv\'\n')

@@ -1,7 +1,8 @@
 # dsh-webui-market-plugin-plus bundle patch: mounts the plugin market over the
-# web profile. The host half registers the /api/dsh-market HTTP route; the
-# client half contributes the Settings → Plugins → Plugin Market tab plus a
-# frame-wide install progress indicator.
+# web profile. The host half registers the /api/dsh-market HTTP route (GitHub
+# real-time search + install/uninstall/update/enable-disable); the client half
+# contributes the startup onboarding plugin-market step, the Settings → Plugins
+# → Plugin Market tab, and a frame-wide install progress indicator.
 
 - insert:
     - id: dsh-market-plugin

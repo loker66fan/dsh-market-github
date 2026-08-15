@@ -66,6 +66,11 @@ export const MARKET_CSS = `
 .mkts-site{font-size:12px;color:var(--dsw-alias-label-tertiary);margin-bottom:6px}
 .mkts-site a{color:var(--dsw-static-deepseek-500);text-decoration:none}
 .mkts-site a:hover{text-decoration:underline}
+.mkts-source-note{font-size:11.5px;color:var(--dsw-alias-label-tertiary);margin:0 0 10px}
+.mkts-notice{font-size:12px;color:var(--dsw-alias-label-primary);background:color-mix(in srgb, var(--dsw-static-deepseek-500) 12%, transparent);border:1px solid color-mix(in srgb, var(--dsw-static-deepseek-500) 30%, transparent);border-radius:8px;padding:6px 10px;margin-bottom:10px}
+.mkts-restart-btn{appearance:none;background:var(--dsw-static-deepseek-500);border:1px solid var(--dsw-static-deepseek-500);color:#fff;border-radius:8px;font-size:12px;line-height:1.5;padding:3px 12px;cursor:pointer;white-space:nowrap}
+.mkts-restart-btn:hover:not(:disabled){opacity:.85}
+.mkts-restart-btn:disabled{opacity:.5;cursor:default}
 .mkts-skipcheck{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:8px;cursor:pointer}
 
 /* ── Global (frame-wide) install progress indicator (shell.overlay) ──
@@ -90,4 +95,20 @@ export const MARKET_CSS = `
 .mkts-restart{pointer-events:auto;display:flex;align-items:center;gap:10px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-static-deepseek-500);border-left:3px solid var(--dsw-static-deepseek-500);border-radius:10px;padding:9px 12px;box-shadow:0 8px 28px rgba(0,0,0,.25);font-size:12px;color:var(--dsw-alias-label-primary)}
 .mkts-restart-close{appearance:none;background:none;border:none;color:var(--dsw-alias-label-tertiary);font-size:14px;cursor:pointer;line-height:1;padding:2px 4px}
 .mkts-restart-close:hover{color:var(--dsw-alias-label-primary)}
+
+/* ── Onboarding (startup) plugin market modal ────────────────────────────────
+ * The startup/onboarding entry renders the market inside a full-screen modal
+ * (the onboarding slot's "a step owns its visible chrome" contract), with a
+ * scrim, a header, and a Done/Skip action that hands control back to the
+ * settings onboarding coordinator. */
+.mkts-ob{position:fixed;inset:0;z-index:1000;display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px 24px;overflow:auto}
+.mkts-ob-scrim{position:fixed;inset:0;background:color-mix(in srgb, var(--dsw-alias-bg-base) 62%, transparent)}
+.mkts-ob-card{position:relative;width:min(860px,100%);max-height:88vh;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:16px;box-shadow:0 20px 60px rgba(0,0,0,.4);overflow:hidden}
+.mkts-ob-header{display:flex;align-items:center;gap:14px;padding:16px 18px;border-bottom:1px solid var(--dsw-alias-border-l2)}
+.mkts-ob-title{flex:1;min-width:0}
+.mkts-ob-title h2{margin:0;font-size:17px;font-weight:650;color:var(--dsw-alias-label-primary)}
+.mkts-ob-title p{margin:2px 0 0;font-size:12.5px;color:var(--dsw-alias-label-tertiary)}
+.mkts-ob-body{overflow:auto;padding:14px 18px 18px}
+.mkts-pager{display:flex;justify-content:center;align-items:center;gap:10px;padding:12px 0 4px}
+.mkts-pager-info{font-family:ui-monospace,monospace;font-size:12px;color:var(--dsw-alias-label-tertiary)}
 `
