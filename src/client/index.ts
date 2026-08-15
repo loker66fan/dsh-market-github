@@ -14,6 +14,13 @@
 // refresh or tab switch never loses an in-flight op.
 import { createElement as h, Fragment, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
+import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// Type-only contributions: pull the settings SlotMap merge (so
+// `settings.plugins.tab` is a known key) and the layout SlotMap merge (so
+// `shell.overlay` is a known key). Cross-plugin collaboration goes through the
+// service, never a value import (client bundle purity gate erases these).
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import { MARKET_CSS } from './market-css.ts'
 import {
   apiOp, closeOpState, executeOpState, getOp, killCurrentOp, minimizeOp, openOp,
@@ -467,8 +474,8 @@ function MarketPanel(): ReactNode {
 // ── Plugin body ──────────────────────────────────────────────────────────────
 export const inject = ['slots']
 
-export function apply(ctx: any): void {
-  const slots = ctx.get('slots') as any
+export function apply(ctx: ClientContext): void {
+  const slots = ctx.slots
   if (slots === undefined) return
 
   // Module-level op bus: resume a running op from a prior page load and wire

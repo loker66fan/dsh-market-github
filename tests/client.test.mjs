@@ -52,14 +52,14 @@ check('inject = slots', mod.inject && mod.inject.join(',') === 'slots')
 
 // apply() registers the market tab and the global progress overlay.
 let regs = []
+const slotsStub = {
+  inject(key, cb) { regs.push({ key, reg: cb() }) },
+  register(opts, Component) { return { opts, Component } },
+}
 const ctx = {
+  slots: slotsStub,
   get(name) {
-    if (name === 'slots') {
-      return {
-        inject(key, cb) { regs.push({ key, reg: cb() }) },
-        register(opts, Component) { return { opts, Component } },
-      }
-    }
+    if (name === 'slots') return slotsStub
     return undefined
   },
   effect(fn) { const r = fn(); if (typeof r === 'function') r(); return r },
