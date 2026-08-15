@@ -6,3 +6,19 @@ dist/
 *.tsbuildinfo
 lib/types-client/
 .npm-cache/
+
+# Credentials / secrets — never commit
+# Handles tokens whether bare (ghp_, github_pat_, gho_, ghs_, glpat_) or in
+# files named like tokens/env/keys. Also catches accidental git-credentials
+# copies and gh/docker-style dotfiles with secrets inside.
+.gh-pat*
+*gh-pat*
+*.pat
+*.token
+*_token*
+*.secret
+*.key
+.env
+.env.*
+.git-credentials*
+
