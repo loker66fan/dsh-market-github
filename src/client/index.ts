@@ -416,10 +416,12 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
     apiOp('toggleActive', { profile: p.profile, name: pkgName, enabled: !active }).then((r) => {
       setToggling(null)
       if (r && r.ok) {
-        setData((d: any) => ({ ...d, toast: r.error ? r.error : (r.needsRestart ? t('restartBanner') : (r.active ? t('activeLive') : t('inactiveLive'))) }))
+        // Same message-discriminated copy + neutral styling as InstalledPanel.
+        const toast = toggleOkToast(r)
+        setData((d: any) => ({ ...d, toast: toast.text, toastKind: toast.kind }))
         loadInstalled()
       } else {
-        setData((d: any) => ({ ...d, toast: String((r && r.error) || t('opFailed')) }))
+        setData((d: any) => ({ ...d, toast: String((r && r.error) || t('opFailed')), toastKind: 'err' }))
       }
     }).catch(() => { setToggling(null) })
   }
@@ -514,7 +516,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
   const toast = data.toast
 
   return h('div', { className: 'mkts', ref: topRef },
-    toast ? h('div', { className: 'mkts-err' }, toast) : null,
+    toast ? h('div', { className: data.toastKind === 'ok' ? 'mkts-toast' : 'mkts-err' }, toast) : null,
     data.self && data.self.updateAvailable ? h('div', { className: 'mkts-selfupdate' },
       h('span', { style: { flex: 1 } }, fmt('selfUpdate', { cur: data.self.version, latest: data.self.latestVersion })),
       h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-primary', disabled: !!(op && op.phase !== 'done'), onClick: () => openOp('update', data.self.name, data.self.name, 'web') }, t('updateBtn')),
@@ -682,6 +684,23 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
 // template bundles are read-only and collapsed behind a toggle.
 
 /**
+ * Toast copy for a successful toggleActive, keyed by the host's `message`
+ * discriminator ('enabled:live' / 'enabled:restart' / 'disabled:live' /
+ * 'disabled:restart'); when the host sends no message, fall back to the
+ * pre-message needsRestart/active inference. Always a 'ok' toast.
+ */
+function toggleOkToast(r: any): { text: string; kind: 'ok' } {
+  switch (r && r.message) {
+    case 'disabled:live': return { text: t('inactiveLive'), kind: 'ok' }
+    case 'disabled:restart': return { text: t('restartBanner'), kind: 'ok' }
+    case 'enabled:live': return { text: t('activeLive'), kind: 'ok' }
+    case 'enabled:restart': return { text: t('restartBanner'), kind: 'ok' }
+    default:
+      return { text: r && r.needsRestart ? t('restartBanner') : (r && r.active ? t('activeLive') : t('inactiveLive')), kind: 'ok' }
+  }
+}
+
+/**
  * State badge for an installed row, upgraded from the two-state
  * enabled/disabled pill to the runtime loader phase when the host reports one
  * (`live`): running (green) when the fiber is ACTIVE, load-failed (red) when
@@ -725,14 +744,17 @@ function InstalledPanel(): ReactElement {
     apiOp('toggleActive', { profile: 'web', name: row.name, enabled: !row.enabled }).then((r) => {
       setToggling(null)
       if (r && r.ok) {
-        setData((d: any) => ({ ...d, toast: r.needsRestart ? t('restartBanner') : (r.active ? t('activeLive') : t('inactiveLive')) }))
+        // The host's message discriminator picks the copy (live vs restart);
+        // success feedback is a neutral toast, not the red error style.
+        const toast = toggleOkToast(r)
+        setData((d: any) => ({ ...d, toast: toast.text, toastKind: toast.kind }))
         load()
       } else {
-        setData((d: any) => ({ ...d, toast: String((r && (r.error || r.output)) || t('opFailed')) }))
+        setData((d: any) => ({ ...d, toast: String((r && (r.error || r.output)) || t('opFailed')), toastKind: 'err' }))
       }
     }).catch((e) => {
       setToggling(null)
-      setData((d: any) => ({ ...d, toast: String((e && e.message) || t('opFailed')) }))
+      setData((d: any) => ({ ...d, toast: String((e && e.message) || t('opFailed')), toastKind: 'err' }))
     })
   }
 
@@ -741,7 +763,7 @@ function InstalledPanel(): ReactElement {
   const opActive = !!(getOp() && getOp()!.phase !== 'done')
 
   return h('div', { className: 'mkts' },
-    data.toast ? h('div', { className: 'mkts-err' }, data.toast) : null,
+    data.toast ? h('div', { className: data.toastKind === 'ok' ? 'mkts-toast' : 'mkts-err' }, data.toast) : null,
     data.self && data.self.updateAvailable ? h('div', { className: 'mkts-selfupdate' },
       h('span', { style: { flex: 1 } }, fmt('selfUpdate', { cur: data.self.version, latest: data.self.latestVersion })),
       h('button', {

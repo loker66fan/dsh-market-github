@@ -18,10 +18,18 @@ const jobStarts = []
 const fakeTools = {
   register(def) { registeredTools.set(def.name, def); return () => registeredTools.delete(def.name) },
 }
+// Live hooks per started job id: { spec, hooks } — most recent job wins.
+const jobHooks = new Map()
 const fakeJobs = {
   start(spec) {
     jobStarts.push(spec)
-    return 'market-' + jobStarts.length
+    // Invoke run() like the real registry (preflight passed → hooks registered;
+    // a throw means nothing registered). The hooks are recorded so their
+    // semantics (cancel scoping, done, readOutput cursor) can be asserted.
+    const hooks = spec.run()
+    const id = 'market-' + jobStarts.length
+    jobHooks.set(id, { spec, hooks })
+    return id
   },
 }
 let toolsAvailable = true
@@ -565,7 +573,7 @@ if (bgResult !== null) {
       typeof bgResult.jobId === 'string' && bgResult.jobId.length > 0, bgResult)
     check('market_install started one job of kind market-install',
       jobStarts.length === 1 && jobStarts[0].kind === 'market-install' && jobStarts[0].label === '@some/pkg', jobStarts)
-    check('market_install job spec carries run hooks (not executed by fake)',
+    check('market_install job spec carries run hooks',
       typeof jobStarts[0].run === 'function', jobStarts[0])
   } else {
     // Jobs absent at execute time (flags flipped) or the sync fallback ran —
@@ -577,7 +585,17 @@ if (bgResult !== null) {
 
 // --- single-flight: a running activeOp makes the tool throw before any job ---
 // Start a real op through the route with a slow fake bin, then call the tool.
+// Wait until the op is observably running first: the previous test's op may
+// still be settling, and startOp's chokepoint would (correctly) refuse busy.
 writeFileSync(fakeBin, `setTimeout(() => {}, 60000)\n`)
+{
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    const st = await call({ method: 'op' })
+    if (st.ok && (!st.op || st.op.status !== 'running')) break
+    await new Promise((r) => setTimeout(r, 100))
+  }
+}
 const slowOp = await call({ method: 'install', source: 'fake:slow-tool', profile: 'web', binPath: fakeBin, label: 'slow-tool', skipCheck: true })
 check('slow op starts for single-flight test', slowOp.ok === true && slowOp.opId, slowOp)
 jobStarts.length = 0
@@ -589,6 +607,20 @@ try {
 }
 check('market_install refuses while an op is running', busyError !== null && /已有任务进行中/.test(String(busyError && busyError.message)), String(busyError && busyError.message))
 check('no job started while busy', jobStarts.length === 0, jobStarts)
+
+// --- single-flight AT THE CHOKEPOINT: startOp itself refuses while running ---
+// The call-site checks above are fast-path only; startOp() is the one window
+// that closes the race for all five entry points. Verify directly: while the
+// slow op above is still live, a second startOp must return busy (and must NOT
+// overwrite activeOp or spawn a child).
+if (mod.startOp) {
+  const direct = mod.startOp('install', 'web', 'fake:chokepoint', 'chokepoint', fakeBin, '')
+  check('startOp refuses busy while an op is running (chokepoint)',
+    direct.ok === false && direct.busy === true && /已有任务进行中/.test(String(direct.error || '')), direct)
+  const still = await call({ method: 'op', opId: slowOp.opId })
+  check('busy refusal leaves the running op untouched',
+    still.ok && still.op && still.op.id === slowOp.opId && still.op.status === 'running', still.op && still.op)
+}
 await call({ method: 'kill' })
 await new Promise((r) => setTimeout(r, 300))
 
@@ -602,6 +634,141 @@ try {
 }
 check('market_update refuses unknown plugin', updErr !== null && /未安装/.test(String(updErr && updErr.message)), String(updErr && updErr.message))
 check('no job started for unknown plugin', jobStarts.length === 0, jobStarts)
+
+// --- background job full chain: market_update through fake jobs' run() ---
+// fakeJobs invokes spec.run() like the real registry, so a tool-initiated
+// update with the jobs service present spawns the real op (slow fake bin) and
+// wires its hooks. Verify: background handle → readOutput increments → cancel
+// → done resolves {status:'killed'}.
+{
+  // Point the profile at a throwaway DSH_HOME so the update writes nothing,
+  // and pin DSH_BIN at the fake bin: the tool path auto-detects the CLI, and
+  // the default pin (process.execPath) would fail the child instantly.
+  const updHome = join(tmpdir(), 'mkts-job-home-' + process.pid)
+  const updOrig = process.env.DSH_HOME
+  const updOrigBin = process.env.DSH_BIN
+  process.env.DSH_HOME = updHome
+  process.env.DSH_BIN = fakeBin
+  const uprof = join(updHome, 'profiles', 'web')
+  mkdirSync(uprof, { recursive: true })
+  writeFileSync(join(uprof, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-web', private: true,
+    dependencies: { 'mkts-dummy': '^1.0.0' },
+  }, null, 2) + '\n')
+  // The slow fake bin prints a line, waits, prints again — exercising both a
+  // readOutput increment and the kill path.
+  writeFileSync(fakeBin, `
+  process.stdout.write('step-1\\n')
+  setTimeout(() => { process.stdout.write('step-2\\n') }, 1500)
+  setTimeout(() => {}, 60000)
+  `)
+  jobStarts.length = 0
+  jobHooks.clear()
+  let bg = null
+  let updBusy = null
+  try {
+    bg = await mu.execute({ name: 'mkts-dummy' }, toolExec)
+  } catch (e) { updBusy = e }
+  check('market_update starts a background job', bg !== null && bg.kind === 'background' && typeof bg.jobId === 'string', bg || String(updBusy && updBusy.message))
+  if (bg !== null && bg.kind === 'background') {
+    const rec = jobHooks.get(bg.jobId)
+    check('fake jobs registry holds the job hooks', !!rec && typeof rec.hooks.cancel === 'function'
+      && typeof rec.hooks.readOutput === 'function' && rec.hooks.done instanceof Promise, rec && Object.keys(rec.hooks || {}))
+    if (rec) {
+      // Wait until step-1 has actually been collected (child spawn + stdout
+      // is timing-sensitive on Windows), but never step-2.
+      const first = await new Promise((resolve) => {
+        const deadline = Date.now() + 8000
+        const poll = () => {
+          const text = rec.hooks.readOutput()
+          if (/step-1/.test(text) || Date.now() > deadline) return resolve(text)
+          setTimeout(poll, 100)
+        }
+        poll()
+      })
+      check('job readOutput returns the first increment', /step-1/.test(first) && !/step-2/.test(first), first)
+      rec.hooks.cancel()
+      const outcome = await rec.hooks.done
+      check('job done resolves killed after cancel', outcome && outcome.status === 'killed', outcome)
+      // readOutput after settle still yields the unread delta (cursor coherent).
+      const tail = rec.hooks.readOutput()
+      check('job readOutput cursor stays coherent after kill', typeof tail === 'string', typeof tail)
+    }
+  }
+  // Cleanup the op in case something failed above.
+  await call({ method: 'kill' })
+  await new Promise((r) => setTimeout(r, 300))
+  if (updOrig === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = updOrig
+  if (updOrigBin === undefined) process.env.DSH_BIN = process.execPath
+  else process.env.DSH_BIN = updOrigBin
+  try { rmSync(updHome, { recursive: true, force: true }) } catch {}
+}
+
+// --- marketJobHooks semantics (pure hooks factory, no jobs service) ---
+if (mod.marketJobHooks) {
+  // Build a minimal op stand-in and drive the hooks directly: the readOutput
+  // cursor must survive the 200KB tail truncation, and cancel() must scope to
+  // the op it wrapped (a stale job's cancel must not kill a successor op).
+  const mkOp = () => ({
+    id: 'op-test', kind: 'install', profile: 'web', target: 'x', label: 'l',
+    startedAt: Date.now(), status: 'running', output: '', totalLen: 0,
+    exitCode: null, hot: false, beforeDeps: {}, child: null, timer: null,
+    settled: new Promise((resolve) => { mkOpResolve = resolve }),
+  })
+  let mkOpResolve = null
+  const op1 = mkOp()
+  const hooks = mod.marketJobHooks(op1)
+  // Head + first chunk.
+  const BIG = 210000 // > MAX_OUTPUT (200000): forces one truncation mid-stream
+  op1.output = ('h'.repeat(50000))
+  op1.totalLen = 50000
+  const r1 = hooks.readOutput()
+  check('marketJobHooks readOutput first read emits from zero', r1.length === 50000, r1.length)
+  // Simulate appendOutput truncation: append 210k, buffer keeps the last 200k.
+  const chunk = 'x'.repeat(BIG)
+  op1.output = (op1.output + chunk).slice(-200000)
+  op1.totalLen += BIG
+  const r2 = hooks.readOutput()
+  // The cumulative delta since cursor 50000 is 210k x's, but the buffer only
+  // retains cumulative 60000..259999 — the first 10k x's are truncated away,
+  // so the read yields the retained 200k x's (never a stale index into the
+  // pre-truncation buffer, which would have re-emitted or skipped text).
+  check('marketJobHooks readOutput survives 200KB truncation', r2.length === 200000 && /^x+$/.test(r2), r2.length)
+  const r3 = hooks.readOutput()
+  check('marketJobHooks readOutput empty when nothing new', r3 === '', JSON.stringify(r3).slice(0, 40))
+  // cancel scoping: op1 is not activeOp here (never started via startOp), so
+  // cancel must NOT settle or kill anything — it is a scoped no-op.
+  hooks.cancel()
+  check('marketJobHooks cancel scoped: non-active op not settled', op1.status === 'running', op1.status)
+  // done maps statuses through op.settled.
+  mkOpResolve({ status: 'killed', exitCode: null })
+  const outcome = await hooks.done
+  check('marketJobHooks done maps killed outcome', outcome.status === 'killed', outcome)
+} else {
+  check('marketJobHooks test hook exposed', false, 'no marketJobHooks export')
+}
+
+// --- liveLoaderStates: FAILED wins over non-FAILED twins (injectable) ---
+if (mod.liveLoaderStates) {
+  const mkLoader = (rows) => ({ entries: () => rows.map(([name, state]) => ({ options: { name }, fiber: state === undefined ? null : { state }, disabled: false })) })
+  // prev FAILED, new non-FAILED → the FAILED entry is kept.
+  const a = mod.liveLoaderStates(mkLoader([
+    ['twin-pkg', 3], // FAILED first
+    ['twin-pkg', 2], // ACTIVE duplicate
+  ]))
+  check('liveLoaderStates keeps FAILED over later non-FAILED twin', a !== null && a.get('twin-pkg') && a.get('twin-pkg').state === 3, a && a.get('twin-pkg'))
+  // prev non-FAILED, new FAILED → the FAILED entry overwrites.
+  const b = mod.liveLoaderStates(mkLoader([
+    ['twin-pkg', 2], // ACTIVE first
+    ['twin-pkg', 3], // FAILED duplicate
+  ]))
+  check('liveLoaderStates lets new FAILED overwrite non-FAILED twin', b !== null && b.get('twin-pkg') && b.get('twin-pkg').state === 3, b && b.get('twin-pkg'))
+  // No loader argument and no hotCtx loader → null (headless projection).
+  check('liveLoaderStates null without a loader', mod.liveLoaderStates() === null, mod.liveLoaderStates())
+} else {
+  check('liveLoaderStates test hook exposed', false, 'no liveLoaderStates export')
+}
 
 const tail = skipped > 0 ? ' (' + skipped + ' skipped)' : ''
 console.log(failures === 0 ? 'ALL PASS' + tail : failures + ' FAILURES' + tail)
