@@ -6,7 +6,7 @@
 // scripts/build.mjs) is not wiped.
 import { defineConfig } from 'tsdown'
 
-const ID = 'dsh-webui-market-plugin-plus'
+const ID = 'dsh-market-github'
 
 /** Platform modules the loader table answers; everything else must inline. */
 const EXTERNALS = ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client']

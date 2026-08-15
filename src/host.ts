@@ -30,7 +30,7 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 
-export const name = 'dsh-market-plugin-plus'
+export const name = 'dsh-market-github'
 
 /** Hard dependency: the HTTP carrier must exist before the route registers. */
 export const inject = ['webServer']

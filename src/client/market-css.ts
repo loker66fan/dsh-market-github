@@ -40,6 +40,9 @@ export const MARKET_CSS = `
 .mkts-gh{margin-left:8px;font-size:11px;color:var(--dsw-static-deepseek-500);text-decoration:none}
 .mkts-gh:hover{text-decoration:underline}
 .mkts-desc{margin:2px 0 0;color:var(--dsw-alias-label-secondary);font-size:12.5px;max-width:52em;overflow-wrap:break-word}
+.mkts-topics{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.mkts-topic{font-size:10.5px;font-family:ui-monospace,monospace;color:var(--dsw-alias-label-tertiary);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:0 8px;line-height:16px}
+.mkts-topic:hover{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-label-dimmed)}
 .mkts-actions{flex:none;display:flex;flex-direction:column;gap:4px;align-items:flex-end}
 .mkts-cmdbtn{appearance:none;background:none;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);padding:3px 12px;cursor:pointer;white-space:nowrap}
 .mkts-cmdbtn:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed)}

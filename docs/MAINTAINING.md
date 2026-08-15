@@ -1,4 +1,4 @@
-# 本地维护 / 发布说明（dsh-webui-market-plugin-plus）
+# 本地维护 / 发布说明（dsh-market-github）
 
 本 fork 的本地 git 版本管理约定。克隆/提交/发布都在本目录完成，方便随时更新与回滚。
 
@@ -44,7 +44,7 @@ git add -A && git commit -m "说明"
 
 ```bash
 # HTTPS（把 <USER> 换成你的 GitHub 用户名；密码填 token）
-git remote add origin https://<USER>@github.com/<USER>/dsh-webui-market-plugin-plus.git
+git remote add origin https://<USER>@github.com/<USER>/dsh-market-github.git
 git push -u origin main
 git push origin --tags
 ```
@@ -52,7 +52,7 @@ git push origin --tags
 或配好 SSH key 后：
 
 ```bash
-git remote add origin git@github.com:<USER>/dsh-webui-market-plugin-plus.git
+git remote add origin git@github.com:<USER>/dsh-market-github.git
 git push -u origin main
 git push origin --tags
 ```
@@ -70,7 +70,7 @@ npm publish               # 发布当前 version
 git tag -a v0.3.0 -m "..." && git push origin --tags
 ```
 
-发布后用户一行安装：`dsh plugin --profile web add dsh-webui-market-plugin-plus`（若你改名/加 scope，命令里的包名同步改）。
+发布后用户一行安装：`dsh plugin --profile web add dsh-market-github`（若你改名/加 scope，命令里的包名同步改）。
 
 ## 安装到 dsh web profile
 
@@ -78,7 +78,7 @@ git tag -a v0.3.0 -m "..." && git push origin --tags
 # 从本地目录（link，开发时即时生效）
 dsh plugin --profile web add /path/to/dsh-webui-market-plugin-fork
 # 或从 GitHub（发布后）
-dsh plugin --profile web add github:<USER>/dsh-webui-market-plugin-plus
+dsh plugin --profile web add github:<USER>/dsh-market-github
 # 装完重启 web 生效
 pnpm dsh web
 ```

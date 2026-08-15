@@ -1,4 +1,4 @@
-# dsh-webui-market-plugin-plus
+# dsh-market-github
 
 > **Fork / 分叉说明（不是原创）** — 本项目是社区插件
 > **[`@sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)**
@@ -31,19 +31,19 @@ An in-harness plugin market for the dsh web GUI: **startup-page onboarding entry
 已发布 npm（推荐，预构建、零授权）：
 
 ```sh
-dsh plugin --profile web add dsh-webui-market-plugin-plus
+dsh plugin --profile web add dsh-market-github
 ```
 
 从 GitHub 安装（本仓库提交了预构建的 `lib/`，无需任何安装期构建授权）：
 
 ```sh
-dsh plugin --profile web add github:<your>/dsh-webui-market-plugin-plus
+dsh plugin --profile web add github:loker66fan/dsh-market-github
 ```
 
 本地开发链接：
 
 ```sh
-dsh plugin --profile web add /path/to/dsh-webui-market-plugin-plus
+dsh plugin --profile web add /path/to/dsh-market-github
 ```
 
 安装后重启 `dsh web`（热挂载成功的除外）：
