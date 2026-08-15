@@ -116,4 +116,7 @@ export const MARKET_CSS = `
 .mkts-ob-body{overflow:auto;padding:14px 18px 18px}
 .mkts-pager{display:flex;justify-content:center;align-items:center;gap:10px;padding:12px 0 4px}
 .mkts-pager-info{font-family:ui-monospace,monospace;font-size:12px;color:var(--dsw-alias-label-tertiary)}
+.mkts-selfupdate{display:flex;align-items:center;gap:10px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-static-deepseek-500);border-left:3px solid var(--dsw-static-deepseek-500);border-radius:10px;padding:9px 12px;margin-bottom:10px;font-size:12.5px;color:var(--dsw-alias-label-primary)}
+.mkts-builtin{margin-top:14px;border-top:1px solid var(--dsw-alias-border-l2);padding-top:10px}
+.mkts-builtin-row{display:flex;align-items:baseline;gap:8px;font-family:ui-monospace,monospace;font-size:12px;color:var(--dsw-alias-label-tertiary);padding:3px 0}
 `

@@ -28,12 +28,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { request as httpRequest } from 'node:http'
 
 export const name = 'dsh-market-github'
 
-/** Hard dependency: the HTTP carrier must exist before the route registers. */
-export const inject = ['webServer']
+/** Hard dependency: the HTTP carrier and the tool registry must exist before
+ * apply (the model tools register on `ctx.tools`; every shipped profile
+ * mounts dsh-tools). */
+export const inject = ['webServer', 'tools']
 
 const DEFAULT_TIMEOUT = 120000
 
@@ -43,6 +46,112 @@ let opCounter = 0
 
 function dshHome(): string {
   return process.env.DSH_HOME || (homedir() + '/.dsh')
+}
+
+// ── Device proxy auto-detection ──────────────────────────────────────────────
+// Install children (pnpm/git) inherit the process environment, so the market
+// detects the machine's proxy ONCE and applies it to process.env — no
+// hardcoded port. Detection order: explicit env vars, platform system proxy
+// (macOS scutil / Windows registry / GNOME gsettings), then a probe of the
+// common local proxy ports (Clash, mihomo, v2rayN, …).
+
+/** Common local proxy ports, tried in likeliest-first order. */
+const PROXY_PORT_CANDIDATES = [7890, 7897, 7891, 7899, 10808, 10809, 1080, 8888, 8118]
+
+/** Memoized detection promise (null = not started). */
+let proxyPromise: Promise<string | null> | null = null
+let detectedProxyUrl: string | null = null
+
+function execOutput(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: 2500, windowsHide: true }, (error, stdout) => {
+      if (error) reject(error)
+      else resolve(String(stdout || ''))
+    })
+  })
+}
+
+/** Read the OS system-proxy settings; empty string when none/unsupported. */
+async function systemProxyUrl(): Promise<string> {
+  try {
+    if (process.platform === 'darwin') {
+      // scutil --proxy: HTTPEnable/HTTPPort/HTTPSEnable/HTTPSPort/HTTPProxy
+      const out = await execOutput('scutil', ['--proxy'])
+      const m = /HTTPEnable\s*:\s*1[\s\S]*?HTTPProxy\s*:\s*(\S+)[\s\S]*?HTTPPort\s*:\s*(\d+)/.exec(out)
+      if (m) return `http://${m[1]}:${m[2]}`
+    } else if (process.platform === 'win32') {
+      const enable = await execOutput('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyEnable'])
+      if (/0x1/.test(enable)) {
+        const server = await execOutput('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', '/v', 'ProxyServer'])
+        const m = /ProxyServer\s+REG_SZ\s+(.+)/.exec(server)
+        if (m) {
+          const v = m[1].trim()
+          return /^https?:\/\//.test(v) ? v : `http://${v}`
+        }
+      }
+    } else {
+      const mode = await execOutput('gsettings', ['get', 'org.gnome.system.proxy', 'mode'])
+      if (/manual/.test(mode)) {
+        const host = (await execOutput('gsettings', ['get', 'org.gnome.system.proxy.http', 'host'])).trim().replace(/^'|'$/g, '')
+        const port = (await execOutput('gsettings', ['get', 'org.gnome.system.proxy.http', 'port'])).trim()
+        if (host && /^\d+$/.test(port)) return `http://${host}:${port}`
+      }
+    }
+  } catch {}
+  return ''
+}
+
+/** Whether the local port answers as an HTTP proxy (GET-through-probe). */
+function probeProxyPort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = httpRequest({
+      host: '127.0.0.1', port, method: 'GET',
+      path: 'https://www.gstatic.com/generate_204',
+      headers: { Host: 'www.gstatic.com', Connection: 'close' },
+      timeout: 1500,
+    }, (res) => {
+      res.resume()
+      // 204 = proxy works; 5xx = proxy answered but upstream unreachable —
+      // both prove the port is a proxy. Plain servers 400/404 a full-URL path.
+      resolve(res.statusCode === 204 || (res.statusCode !== undefined && res.statusCode >= 500))
+    })
+    req.on('error', () => resolve(false))
+    req.on('timeout', () => { req.destroy(); resolve(false) })
+    req.end()
+  })
+}
+
+/** Detect the device proxy URL: env vars, system settings, then port probes. */
+async function detectProxy(): Promise<string | null> {
+  const env = process.env.HTTP_PROXY || process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.ALL_PROXY || process.env.all_proxy
+  if (env) return env
+  const system = await systemProxyUrl()
+  if (system) return system
+  for (const port of PROXY_PORT_CANDIDATES) {
+    if (await probeProxyPort(port)) return `http://127.0.0.1:${port}`
+  }
+  return null
+}
+
+/** Run detection once; on success, apply it to process.env for all children. */
+function ensureProxyDetected(): Promise<string | null> {
+  if (proxyPromise === null) {
+    proxyPromise = detectProxy().then((url) => {
+      detectedProxyUrl = url
+      if (url !== null) {
+        if (process.env.HTTP_PROXY === undefined && process.env.http_proxy === undefined) process.env.HTTP_PROXY = url
+        if (process.env.HTTPS_PROXY === undefined && process.env.https_proxy === undefined) process.env.HTTPS_PROXY = url
+        if (process.env.NO_PROXY === undefined && process.env.no_proxy === undefined) process.env.NO_PROXY = 'localhost,127.0.0.1'
+      }
+      return url
+    }).catch(() => null)
+  }
+  return proxyPromise
+}
+
+/** Wait up to `maxMs` for proxy detection before an install child spawns. */
+async function waitProxyReady(maxMs: number): Promise<void> {
+  await Promise.race([ensureProxyDetected(), new Promise((resolve) => setTimeout(resolve, maxMs))])
 }
 
 /**
@@ -1006,7 +1115,360 @@ async function checkUpdates(profile: string): Promise<Record<string, any>> {
 const UPDATES_TTL_MS = 10 * 60 * 1000
 let updatesCache: Record<string, any> = {}
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, codeloadSpec, allowBuildKeys } // test hooks
+// ── Install spec resolution (shared by the web route and market_install) ─────
+
+/**
+ * Resolve the concrete spec pnpm should install and run the safety gate:
+ * GitHub sources are verified against their dsh manifest; bundle-only plugins
+ * get a throwaway trial boot; web-client plugins prefer a registry-verified
+ * npm tarball and fall back to the codeload tarball with build consent.
+ * Registry specs pass through untouched.
+ */
+async function resolveInstallSpec(
+  target: string,
+  bin: string,
+  profile: string,
+): Promise<{ ok: true; installSpec: string } | { ok: false; refused: boolean; output: string }> {
+  let installSpec = target
+  if (/^github:/.test(target)) {
+    const cls = await classifyPlugin(target)
+    if (!cls.known) {
+      return {
+        ok: false,
+        refused: true,
+        output: '无法验证该插件：读取其 package.json 的 dsh 清单失败'
+          + (cls.fetchFailed ? '（GitHub 抓取失败，可能是网络或镜像问题）' : '，它可能不是 dsh 插件')
+          + '。如确需安装（风险自负），请勾选"跳过安全检查"。',
+      }
+    }
+    // Direct git to github.com hangs on many networks while the codeload CDN
+    // stays reachable — install through the tarball URL instead of git.
+    const tarball = codeloadSpec(target)
+    const buildKeys = allowBuildKeys(cls.pkgName ?? null, tarball)
+    if (!cls.webClient) {
+      const verdict = await runProbe(bin, tarball ?? target, buildKeys)
+      if (!verdict.ok) {
+        const stage = verdict.stage === 'install'
+          ? '候选插件安装进试装环境失败'
+          : '试装启动验证失败：该插件装进 web profile 无法正常启动'
+        return {
+          ok: false,
+          refused: true,
+          output: stage + '（真实 profile 未受影响，试装目录已清理）：\n\n' + String(verdict.output || '').slice(-8000)
+            + '\n\n如需强制安装（风险自负），请勾选"跳过安全检查"。',
+        }
+      }
+      for (const k of buildKeys) ensureAllowBuilds(profile, k)
+      if (tarball !== null) installSpec = tarball
+    } else {
+      const npm = await npmRegistrySpec(target, cls.pkgName ?? null)
+      if (npm !== null) {
+        installSpec = npm
+      } else {
+        for (const k of buildKeys) ensureAllowBuilds(profile, k)
+        if (tarball !== null) installSpec = tarball
+      }
+    }
+  }
+  return { ok: true, installSpec }
+}
+
+// ── Installed-state projection (built-in vs third-party) ────────────────────
+
+/** One row of the installed-plugins view. */
+interface InstalledRow {
+  name: string
+  kind: 'builtin' | 'installed'
+  enabled: boolean
+  version: string | null
+  spec: string | null
+  latestVersion: string | null
+  updateAvailable: boolean
+}
+
+/**
+ * Project a profile's active layer into built-in (template bundles, read-only)
+ * and user-installed (profile dependencies) plugin rows, merged with update
+ * availability. The market's own package appears as an installed row.
+ */
+async function listInstalled(profile: string): Promise<InstalledRow[]> {
+  const deps = readProfileDeps(profile)
+  const bundles = readProfileBundles(profile)
+  const updates = await checkUpdates(profile)
+  const rows: InstalledRow[] = []
+  for (const name of bundles) {
+    if (deps[name] !== undefined) continue // user-installed: emitted below
+    rows.push({
+      name,
+      kind: 'builtin',
+      enabled: true,
+      version: readInstalledVersion(profile, name),
+      spec: null,
+      latestVersion: null,
+      updateAvailable: false,
+    })
+  }
+  for (const [name, spec] of Object.entries(deps)) {
+    const enabled = bundles.some((b) => normalizeBundleName(b) === normalizeBundleName(name))
+    const up = updates[name] as { latest?: string | null; updateAvailable?: boolean } | undefined
+    rows.push({
+      name,
+      kind: 'installed',
+      enabled,
+      version: readInstalledVersion(profile, name),
+      spec: String(spec),
+      latestVersion: up && up.latest != null ? String(up.latest) : null,
+      updateAvailable: !!(up && up.updateAvailable),
+    })
+  }
+  return rows
+}
+
+// ── Market self-update check ─────────────────────────────────────────────────
+
+const MARKET_NAME = 'dsh-market-github'
+
+/**
+ * Compare the installed market version with the latest one on its own GitHub
+ * repository (the `repository` field of this very package.json). A fork that
+ * repoints `repository` therefore checks against its own upstream.
+ */
+async function checkSelfUpdate(profile: string): Promise<{ name: string; version: string | null; latestVersion: string | null; updateAvailable: boolean }> {
+  const version = readInstalledVersion(profile, MARKET_NAME)
+  let latestVersion: string | null = null
+  try {
+    const own = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
+    const repoUrl = own.repository && (own.repository.url || own.repository)
+    const m = /github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/.exec(String(repoUrl || ''))
+    if (m !== null) {
+      const res = await fetch(`https://api.github.com/repos/${m[1]}/contents/package.json`, {
+        headers: { accept: 'application/vnd.github.raw+json', 'user-agent': 'dsh-market', ...gitHubAuth() },
+        signal: AbortSignal.timeout(8000),
+      })
+      if (res.ok) {
+        const meta: any = await res.json()
+        if (typeof meta.version === 'string') latestVersion = meta.version
+      }
+    }
+  } catch {}
+  return {
+    name: MARKET_NAME,
+    version,
+    latestVersion,
+    updateAvailable: version !== null && latestVersion !== null && version !== latestVersion,
+  }
+}
+
+// ── Model tools: the agent can search/install/manage plugins itself ─────────
+
+/** The profile the model tools operate on (mirrors the web UI default). */
+const TOOL_PROFILE = 'web'
+
+/** Run one dsh CLI invocation synchronously and return the captured result. */
+function runCliSync(args: string[], timeoutMs: number): Promise<any> {
+  const inv = dshInvoke()
+  if (!inv) return Promise.reject(new Error('dsh CLI 未定位（可在面板填写路径）'))
+  return spawnCapture(inv.file, [...inv.args, ...args], {
+    cwd: inv.cwd ?? profileDir(TOOL_PROFILE),
+    env: { ...process.env, CI: 'true' },
+    timeoutMs,
+  })
+}
+
+/** Register the market_* tools when the tool registry service exists. */
+function registerMarketTools(ctx: any): void {
+  const tools = ctx.get('tools')
+  if (tools === undefined) return
+
+  tools.register({
+    name: 'market_search',
+    description: 'Search the DeepSeek Harness plugin marketplace (GitHub `dsh-plugin` topic) for installable plugins. Returns a JSON list of repositories: full name, stars, language, one-line description, and URL. Supports a keyword and pagination (the topic holds 1800+ repos; page through with `page`/`perPage`). Use this before market_install to find the right repo.',
+    parameters: {
+      type: 'object',
+      properties: {
+        q: { type: 'string', description: 'Search keyword within the dsh-plugin topic (name/description/language). Empty returns the top-starred page.' },
+        page: { type: 'integer', description: 'Page number (1-based, default 1).' },
+        perPage: { type: 'integer', description: 'Results per page (max 100, default 50).' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          items: { type: 'array', items: { type: 'object', properties: { fullName: { type: 'string' }, name: { type: 'string' }, url: { type: 'string' }, description: { type: 'string' }, stars: { type: 'integer' }, language: { type: 'string' }, updatedAt: { type: 'string' } }, additionalProperties: true } },
+          total: { type: 'integer' },
+          page: { type: 'integer' },
+          perPage: { type: 'integer' },
+          hasMore: { type: 'boolean' },
+        },
+        additionalProperties: true,
+      },
+      render(_args: any, value: any): any[] {
+        const v = value
+        const lines = [`DSH 插件市场：共 ${v.total} 个仓库（第 ${v.page} 页 / 每页 ${v.perPage}${v.hasMore ? '，还有更多' : ''}）`]
+        for (const it of v.items) {
+          lines.push(`- ${it.fullName} (★${it.stars}${it.language ? ', ' + it.language : ''}) — ${it.description || '无简介'}`)
+        }
+        if (v.hasMore) lines.push('提示：用 page/perPage 翻页，或用 q 缩小范围。')
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute(args: any) {
+      const q = String((args && args.q) || '').trim()
+      const page = Math.max(1, Number((args && args.page) || 1))
+      const perPage = Math.min(100, Math.max(1, Number((args && args.perPage) || 50)))
+      const r = await searchGitHub(q, { sort: 'stars', order: 'desc', page, perPage })
+      if (r.error) throw new Error(r.error)
+      return {
+        items: r.plugins.map((p: any) => ({
+          fullName: String(p.source || '').replace(/^github:/, ''),
+          name: p.name,
+          url: p.url,
+          description: p.desc,
+          stars: p.stars ?? 0,
+          language: p.lang ?? '',
+          updatedAt: p.added ?? '',
+        })),
+        total: r.total,
+        page,
+        perPage,
+        hasMore: page * perPage < r.total,
+      }
+    },
+  })
+
+  tools.register({
+    name: 'market_install',
+    description: 'Install a plugin from the DeepSeek Harness plugin marketplace into the `web` profile. Accepts a GitHub repo as `owner/repo`, a git URL, an npm package name, or a local path. Runs the same safety gate as the UI (dsh-manifest verification + throwaway trial boot), then `dsh plugin --profile web add <spec>`; returns the pnpm output and whether a harness restart is required. Verify the repo with market_search first.',
+    parameters: {
+      type: 'object',
+      properties: {
+        spec: { type: 'string', description: 'Package name, GitHub owner/repo, git URL, or local path to install.' },
+      },
+      required: ['spec'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { ok: { type: 'boolean' }, spec: { type: 'string' }, installed: { type: 'string' }, needsRestart: { type: 'boolean' }, output: { type: 'string' } },
+        additionalProperties: true,
+      },
+      render(_args: any, value: any): any[] {
+        return [{ type: 'text', text: value.ok
+          ? `已安装 ${value.installed}${value.needsRestart ? '（重启 harness 后生效）' : '（已热挂载，免重启）'}\n${value.output}`
+          : `安装失败：\n${value.output}` }]
+      },
+    },
+    async execute(args: any) {
+      const spec = String((args && args.spec) || '').trim()
+      if (!spec) throw new Error('market_install requires a non-empty spec')
+      const bin = String(dshBin() || '')
+      if (!bin) throw new Error('dsh CLI 未定位（可在面板填写路径）')
+      const before = readProfileDeps(TOOL_PROFILE)
+      const resolved = await resolveInstallSpec(spec, bin, TOOL_PROFILE)
+      if (!resolved.ok) throw new Error(resolved.output)
+      const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', resolved.installSpec], PROBE_INSTALL_TIMEOUT)
+      if (!result.ok) {
+        throw new Error('安装失败（exit ' + String(result.code ?? '?') + '）：\n' + String(result.output || '').slice(-4000))
+      }
+      let needsRestart = true
+      if (hotCtx !== null) {
+        try {
+          const hot = await tryHotMountAll(hotCtx, TOOL_PROFILE, before)
+          needsRestart = !hot.hot
+        } catch { needsRestart = true }
+      }
+      return { ok: true, spec, installed: resolved.installSpec, needsRestart, output: String(result.output || '').slice(-4000) }
+    },
+  })
+
+  tools.register({
+    name: 'market_installed',
+    description: 'List the plugins in the `web` profile with their versions and update availability. Returns `plugins` (each with `name`, `kind` = `builtin` or `installed`, `enabled`, `version`, `latestVersion`, `updateAvailable`) and `self` when this marketplace itself can be updated. Use this before market_update to find names.',
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          plugins: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string' }, enabled: { type: 'boolean' }, version: { type: 'string' }, latestVersion: { type: 'string' }, updateAvailable: { type: 'boolean' } }, additionalProperties: true } },
+          self: { type: 'object', properties: { name: { type: 'string' }, version: { type: 'string' }, latestVersion: { type: 'string' } }, additionalProperties: true },
+          restartHint: { type: 'string' },
+        },
+        additionalProperties: true,
+      },
+      render(_args: any, value: any): any[] {
+        const lines: string[] = []
+        for (const p of value.plugins) {
+          const upd = p.updateAvailable ? `（可更新：v${p.version} → v${p.latestVersion}，用 market_update name=${p.name}）` : ''
+          lines.push(`- ${p.name} [${p.kind}]${p.enabled ? '' : '（已停用）'} v${p.version ?? '?'}${upd}`)
+        }
+        if (value.self) lines.push(`插件市场可更新：v${value.self.version} → v${value.self.latestVersion}（用 market_update name=${value.self.name}）`)
+        if (value.plugins.length === 0) lines.push('（没有后装插件）')
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    async execute() {
+      const rows = await listInstalled(TOOL_PROFILE)
+      const self = await checkSelfUpdate(TOOL_PROFILE)
+      return {
+        plugins: rows.map((r) => ({
+          name: r.name,
+          kind: r.kind,
+          enabled: r.enabled,
+          version: r.version,
+          latestVersion: r.latestVersion,
+          updateAvailable: r.updateAvailable,
+        })),
+        self: self.updateAvailable ? { name: self.name, version: self.version, latestVersion: self.latestVersion } : null,
+        restartHint: 'install/update/enable/disable 后通常需要重启 harness 才能生效',
+      }
+    },
+  })
+
+  tools.register({
+    name: 'market_update',
+    description: 'Update one installed plugin in the `web` profile to its latest version (a harness restart is required to take effect). Accepts the package `name` exactly as reported by market_installed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Package name of the installed plugin to update (from market_installed).' },
+      },
+      required: ['name'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { ok: { type: 'boolean' }, name: { type: 'string' }, target: { type: 'string' }, needsRestart: { type: 'boolean' }, output: { type: 'string' } },
+        additionalProperties: true,
+      },
+      render(_args: any, value: any): any[] {
+        return [{ type: 'text', text: `已更新 ${value.name} → ${value.target}（重启 harness 后生效）\n${value.output}` }]
+      },
+    },
+    async execute(args: any) {
+      const name = String((args && args.name) || '').trim()
+      if (!name) throw new Error('market_update requires a plugin name (from market_installed)')
+      const deps = readProfileDeps(TOOL_PROFILE)
+      const spec = deps[name]
+      if (spec === undefined) throw new Error('插件未安装：' + name)
+      if (String(spec).startsWith('link:') || String(spec).startsWith('file:')) {
+        throw new Error('本地链接插件从 checkout 更新，无需通过市场更新')
+      }
+      const target = String(spec).startsWith('github:') ? String(spec).replace(/#.*$/, '')
+        : String(spec).startsWith('https://codeload.github.com/') ? String(spec).replace(/\/tar\.gz\/.+$/, '/tar.gz/HEAD')
+        : `${name}@latest`
+      updatesCache = { ...updatesCache, [TOOL_PROFILE]: null }
+      const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', target], PROBE_INSTALL_TIMEOUT)
+      if (!result.ok) {
+        throw new Error('更新失败（exit ' + String(result.code ?? '?') + '）：\n' + String(result.output || '').slice(-4000))
+      }
+      return { ok: true, name, target, needsRestart: true, output: String(result.output || '').slice(-4000) }
+    },
+  })
+  console.log('[dsh-market] registered model tools: market_search, market_install, market_installed, market_update')
+}
+
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -1016,6 +1478,13 @@ export function apply(ctx: any): void {
   }
   hotCtx = ctx
   cleanHotDir('web')
+  // Detect the device proxy once and apply it to process.env so install
+  // children (pnpm/git) inherit it — no hardcoded proxy port.
+  void ensureProxyDetected()
+  // Model-facing tools (market_search / market_install / market_installed /
+  // market_update): registered when the tool registry service exists, so the
+  // agent can search and install plugins itself, not only through the UI.
+  registerMarketTools(ctx)
   webServer.register({
     kind: 'exact',
     path: '/api/dsh-market',
@@ -1049,18 +1518,23 @@ export function apply(ctx: any): void {
             dshBin: dshBin(),
             binProvided: explicit || null,
             binValid,
+            proxy: detectedProxyUrl,
           })
         }
         if (method === 'installed') {
           const profile = validProfile(body.profile) ? body.profile : 'web'
           const p = profileDir(profile) + '/package.json'
-          if (!existsSync(p)) return sendJson(res, 200, { ok: true, profile, bundles: [], dependencies: {} })
+          if (!existsSync(p)) return sendJson(res, 200, { ok: true, profile, bundles: [], dependencies: {}, plugins: [], self: null })
           const json = JSON.parse(readFileSync(p, 'utf8'))
+          const plugins = await listInstalled(profile)
+          const self = await checkSelfUpdate(profile)
           return sendJson(res, 200, {
             ok: true,
             profile,
             bundles: Array.isArray(json.dsh && json.dsh.profile && json.dsh.profile.bundles) ? json.dsh.profile.bundles : [],
             dependencies: json.dependencies || {},
+            plugins,
+            self,
           })
         }
         if (method === 'updates') {
@@ -1087,6 +1561,7 @@ export function apply(ctx: any): void {
             : `${name}@latest`
           const label = String(body.label || name)
           updatesCache = { ...updatesCache, [profile]: null }
+          await waitProxyReady(2000)
           const started = startOp('update', profile, target, label, String(body.binPath || '').trim(),
             '更新 ' + name + ' → ' + target + '\n')
           if (!started.ok) return sendJson(res, 200, started)
@@ -1131,63 +1606,14 @@ export function apply(ctx: any): void {
           if (method === 'install' && profile === 'web' && !body.skipCheck) {
             const bin = String(body.binPath || '').trim() || dshBin()
             if (!bin) return sendJson(res, 200, { ok: false, error: 'dsh CLI 未定位（可在面板填写路径）' })
-            // GitHub sources are verified against their dsh manifest (and, for
-            // bundle-only plugins, a throwaway trial boot) before touching the
-            // real profile. Registry specs skip the probe — pnpm and the Loader
-            // fail loud on boot if they are not loadable.
-            let installSpec = target
-            if (/^github:/.test(target)) {
-              const cls = await classifyPlugin(target)
-              if (!cls.known) {
-                return sendJson(res, 200, {
-                  ok: false,
-                  refused: true,
-                  output: '无法验证该插件：读取其 package.json 的 dsh 清单失败'
-                    + (cls.fetchFailed ? '（GitHub 抓取失败，可能是网络或镜像问题）' : '，它可能不是 dsh 插件')
-                    + '。如确需安装（风险自负），请勾选"跳过安全检查"。',
-                })
-              }
-              // Direct git to github.com hangs on many networks (no proxy
-              // reach, git ignores some setups) while the codeload CDN stays
-              // reachable — install through the tarball URL instead of git.
-              const tarball = codeloadSpec(target)
-              const buildKeys = allowBuildKeys(cls.pkgName ?? null, tarball)
-              if (!cls.webClient) {
-                // Bundle-only plugin: trial boot in a throwaway profile. The
-                // probe consents to the verified package's prepare script in
-                // its own throwaway workspace, so tarball installs pass pnpm's
-                // build block there.
-                const verdict = await runProbe(bin, tarball ?? target, buildKeys)
-                if (!verdict.ok) {
-                  const stage = verdict.stage === 'install'
-                    ? '候选插件安装进试装环境失败'
-                    : '试装启动验证失败：该插件装进 web profile 无法正常启动'
-                  return sendJson(res, 200, {
-                    ok: false,
-                    refused: true,
-                    output: stage + '（真实 profile 未受影响，试装目录已清理）：\n\n' + String(verdict.output || '').slice(-8000)
-                      + '\n\n如需强制安装（风险自负），请勾选"跳过安全检查"。',
-                  })
-                }
-                // Consent the build for exactly this verified package in the
-                // real profile too, and install the tarball there.
-                for (const k of buildKeys) ensureAllowBuilds(profile, k)
-                if (tarball !== null) installSpec = tarball
-              } else {
-                // Web-client plugin: prefer a registry-verified npm tarball
-                // (seconds, no prepare script); fall back to the codeload
-                // tarball (then consent the verified package's build).
-                const npm = await npmRegistrySpec(target, cls.pkgName ?? null)
-                if (npm !== null) {
-                  installSpec = npm
-                } else {
-                  for (const k of buildKeys) ensureAllowBuilds(profile, k)
-                  if (tarball !== null) installSpec = tarball
-                }
-              }
+            const resolved = await resolveInstallSpec(target, bin, profile)
+            if (!resolved.ok) {
+              return sendJson(res, 200, { ok: false, refused: true, output: resolved.output })
             }
+            const installSpec = resolved.installSpec
             const snap = snapshotProfile(profile)
             const label = String(body.label || target)
+            await waitProxyReady(2000)
             const started = startOp(method, profile, installSpec, label, bin,
               snap ? '已备份安装前状态：' + snap + '\n' : '')
             if (!started.ok) return sendJson(res, 200, started)
@@ -1198,6 +1624,7 @@ export function apply(ctx: any): void {
             await disposeHotMount(target)
             await disableLoaderEntry(target)
           }
+          await waitProxyReady(2000)
           const started = startOp(method, profile, target, label, String(body.binPath || '').trim())
           if (!started.ok) return sendJson(res, 200, started)
           return sendJson(res, 200, { ok: true, opId: started.opId, timeoutMs: DEFAULT_TIMEOUT })

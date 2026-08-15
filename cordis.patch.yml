@@ -1,10 +1,14 @@
 # dsh-market-github bundle patch: mounts the plugin market over the web
 # profile. The host half registers the /api/dsh-market HTTP route (GitHub
-# real-time search + install/uninstall/update/enable-disable/restart); the
-# client half contributes the startup onboarding plugin-market step, the
-# Settings → Plugins → Plugin Market tab, and a frame-wide install progress
-# indicator.
+# real-time search + install/uninstall/update/enable-disable/restart) and the
+# market_search / market_install / market_installed / market_update model
+# tools; the client half contributes the startup onboarding plugin-market step,
+# the Settings → Plugins → Plugin Market and Installed tabs, and a frame-wide
+# install progress indicator. `config.perPage` (1..100, default 50) sets the
+# market list page size.
 
 - insert:
     - id: dsh-market-github
       name: 'dsh-market-github'
+      config:
+        perPage: 50

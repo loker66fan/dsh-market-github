@@ -150,6 +150,12 @@ check('codeloadSpec maps github: to tarball URL', mod.codeloadSpec('github:acme/
 check('codeloadSpec strips .git suffix', mod.codeloadSpec('github:acme/plugin.git') === 'https://codeload.github.com/acme/plugin/tar.gz/HEAD', mod.codeloadSpec('github:acme/plugin.git'))
 check('codeloadSpec null for non-github spec', mod.codeloadSpec('@scope/pkg') === null, mod.codeloadSpec('@scope/pkg'))
 
+// --- device proxy auto-detection ---
+const closedPort = await mod.probeProxyPort(1)
+check('probeProxyPort false for closed port', closedPort === false, closedPort)
+const detected = await mod.detectProxy()
+check('detectProxy returns url or null', detected === null || (typeof detected === 'string' && /^https?:\/\//.test(detected)), detected)
+
 // --- restart route: rejected unless same-origin AND direct loopback ---
 const restCross = await call({ method: 'restart' }, { origin: 'http://evil.example' })
 check('restart rejected cross-origin', restCross.ok === false && /untrusted/.test(restCross.error || ''), restCross)
@@ -316,6 +322,37 @@ check('ensureClientRow appends second row', (patchText2.match(/- insert:/g) || [
 if (origHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = origHome
 try { rmSync(tmpHome, { recursive: true, force: true }) } catch {}
+
+// --- listInstalled: built-in vs third-party projection ---
+const instHome = join(tmpdir(), 'mkts-inst-home-' + process.pid)
+const instOrigHome = process.env.DSH_HOME
+process.env.DSH_HOME = instHome
+const iprof = join(instHome, 'profiles', 'web')
+mkdirSync(iprof, { recursive: true })
+writeFileSync(join(iprof, 'package.json'), JSON.stringify({
+  name: 'dsh-profile-web', private: true,
+  // link:/file: specs short-circuit update checks (offline-safe test).
+  dependencies: { 'whale-girl': 'link:../whale-girl' },
+  dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'whale-girl'] } },
+}, null, 2) + '\n')
+const instRows = await mod.listInstalled('web')
+check('listInstalled splits builtin/installed', instRows.some((r) => r.name === '@deepseek-ai/dsh-base' && r.kind === 'builtin' && r.enabled)
+  && instRows.some((r) => r.name === '@deepseek-ai/dsh-web-app' && r.kind === 'builtin')
+  && instRows.some((r) => r.name === 'whale-girl' && r.kind === 'installed' && r.enabled), instRows)
+
+// --- resolveInstallSpec: registry specs pass through untouched (no network) ---
+const resolved = await mod.resolveInstallSpec('@some/pkg', process.execPath, 'web')
+check('resolveInstallSpec passes registry spec through', resolved.ok === true && resolved.installSpec === '@some/pkg', resolved)
+
+// --- checkSelfUpdate: shape check (network-dependent values are lenient) ---
+const self = await mod.checkSelfUpdate('web')
+check('checkSelfUpdate returns market update shape', self.name === 'dsh-market-github'
+  && typeof self.updateAvailable === 'boolean'
+  && (self.version === null || typeof self.version === 'string'), self)
+
+if (instOrigHome === undefined) delete process.env.DSH_HOME
+else process.env.DSH_HOME = instOrigHome
+try { rmSync(instHome, { recursive: true, force: true }) } catch {}
 
 const tail = skipped > 0 ? ' (' + skipped + ' skipped)' : ''
 console.log(failures === 0 ? 'ALL PASS' + tail : failures + ' FAILURES' + tail)

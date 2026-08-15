@@ -74,6 +74,12 @@ const STR: Record<string, Record<string, string>> = {
     quotaHint: 'GitHub 搜索剩余配额（次/分钟）；配置 GITHUB_TOKEN 可提高',
     opLost: '任务状态丢失（服务可能已重启或任务被其他操作接管），请刷新页面后重试',
     waiting: '已等待 {s}s…',
+    installedTab: '已安装',
+    noInstalled: '还没有安装过第三方插件，去「插件市场」逛逛吧',
+    selfUpdate: '插件市场可更新：v{cur} → v{latest}',
+    builtin: '内置插件（随 harness 提供，只读）',
+    updTo: '→ v{latest}',
+    specNote: '安装源',
   },
   en: {
     search: 'Search plugins…', all: 'All', instFilter: 'Installed', detail: 'Details', collapse: 'Collapse',
@@ -114,10 +120,20 @@ const STR: Record<string, Record<string, string>> = {
     quotaHint: 'GitHub search quota remaining (per minute); set GITHUB_TOKEN to raise it',
     opLost: 'Task state lost (the server may have restarted or another task took over); refresh the page and retry',
     waiting: 'Waited {s}s…',
+    installedTab: 'Installed',
+    noInstalled: 'No third-party plugins installed yet — browse the Plugin Market',
+    selfUpdate: 'Market update available: v{cur} → v{latest}',
+    builtin: 'Built-in plugins (shipped with the harness, read-only)',
+    updTo: '→ v{latest}',
+    specNote: 'source',
   },
 }
 const t = (k: string): string => { const m = STR[LOCALE]; return (m && m[k] !== undefined) ? m[k] : (STR['zh'][k] !== undefined ? STR['zh'][k] : k) }
 const fmt = (k: string, map: Record<string, unknown>): string => String(t(k)).replace(/\{(\w+)\}/g, (_, n) => String(map[n] !== undefined ? map[n] : ''))
+
+// Page size for the market list; overridable per deployment through the
+// plugin's cordis config row (`config: { perPage: 40 }`), clamped to 1..100.
+let MARKET_PER_PAGE = 50
 
 // ── Catalog helpers ──────────────────────────────────────────────────────────
 function repoNameOf(url: any): string {
@@ -300,7 +316,11 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
     const list = plugins || data.plugins || []
     const profiles = [...new Set(list.map((p: any) => p.profile || 'web').concat('web'))]
     Promise.all(profiles.map((profile) => apiOp('installed', { profile }).then((r) => [profile, r]).catch(() => [profile, null])))
-      .then((entries) => setData((d: any) => ({ ...d, installed: Object.fromEntries(entries) })))
+      .then((entries) => {
+        const webEntry = (entries as any[]).find(([profile]) => profile === 'web')
+        const self = webEntry && webEntry[1] && webEntry[1].self ? webEntry[1].self : null
+        setData((d: any) => ({ ...d, installed: Object.fromEntries(entries), self }))
+      })
       .catch(() => setData((d: any) => ({ ...d, installed: null })))
     Promise.all(profiles.map((profile) => apiOp('updates', { profile }).then((r) => [profile, r && r.ok ? (r.updates || {}) : {}]).catch(() => [profile, {}])))
       .then((entries) => setData((d: any) => ({ ...d, updates: Object.fromEntries(entries) })))
@@ -309,7 +329,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
 
   useEffect(() => { probe() }, [])
 
-  const PER_PAGE = 50 // items per page
+  const PER_PAGE = MARKET_PER_PAGE // items per page (deployment-configurable)
   const MAX_RESULTS = 1000 // GitHub search API caps pagination at 1000 total results
   // Monotonic request id: only the latest search may write results (a slow
   // earlier response must not overwrite the newer one).
@@ -476,9 +496,14 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
 
   return h('div', { className: 'mkts' },
     toast ? h('div', { className: 'mkts-err' }, toast) : null,
+    data.self && data.self.updateAvailable ? h('div', { className: 'mkts-selfupdate' },
+      h('span', { style: { flex: 1 } }, fmt('selfUpdate', { cur: data.self.version, latest: data.self.latestVersion })),
+      h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-primary', disabled: !!(op && op.phase !== 'done'), onClick: () => openOp('update', data.self.name, data.self.name, 'web') }, t('updateBtn')),
+    ) : null,
     data.notice ? h('div', { className: 'mkts-notice' }, data.notice) : null,
     embedded ? null : envInfo ? h('div', { className: 'mkts-env' + (envReady ? '' : ' mkts-env-bad') },
       t('envLine') + ': DSH_HOME ' + (envInfo.dshHome ? '✓ ' + envInfo.dshHome : '✗') + ' · node ' + (envInfo.node ? '✓' : '✗') + ' · dsh ' + (binOk ? '✓' : '✗') +
+      (envInfo.proxy ? ' · proxy ✓ ' + envInfo.proxy : ' · proxy ✗（直连）') +
       ((!envInfo.dshBin && !(envInfo.binProvided && envInfo.binValid)) ? ' — dsh CLI 未定位' : ''),
     ) : null,
     embedded ? null : h('div', { className: 'mkts-bin-row' },
@@ -607,12 +632,104 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
   )
 }
 
+// ── InstalledPanel: the dedicated 已安装 tab ──────────────────────────────────
+// Lists user-installed (third-party) plugins with enable/disable, update, and
+// uninstall actions, plus a self-update banner for the market itself. Built-in
+// template bundles are read-only and collapsed behind a toggle.
+function InstalledPanel(): ReactElement {
+  const [data, setData] = useState<any>({ phase: 'loading', plugins: [], self: null })
+  const [toggling, setToggling] = useState<string | null>(null)
+  const [showBuiltin, setShowBuiltin] = useState(false)
+
+  const load = (): void => {
+    apiOp('installed', { profile: 'web' }).then((r) => {
+      setData((d: any) => ({
+        ...d,
+        phase: 'ready',
+        plugins: (r && Array.isArray(r.plugins) && r.plugins) || (d && d.plugins) || [],
+        self: (r && r.self) || null,
+      }))
+    }).catch(() => setData((d: any) => ({ ...d, phase: 'error' })))
+  }
+
+  useEffect(() => { load() }, [])
+  useEffect(() => subscribeOp((o) => {
+    if (!o || o.phase !== 'done') return
+    load()
+  }), [])
+
+  const toggle = (row: any): void => {
+    setToggling(row.name)
+    apiOp('toggleActive', { profile: 'web', name: row.name, enabled: !row.enabled }).then(() => {
+      setToggling(null)
+      load()
+    }).catch(() => setToggling(null))
+  }
+
+  const installed = (data.plugins || []).filter((p: any) => p.kind === 'installed')
+  const builtin = (data.plugins || []).filter((p: any) => p.kind === 'builtin')
+  const opActive = !!(getOp() && getOp()!.phase !== 'done')
+
+  return h('div', { className: 'mkts' },
+    data.self && data.self.updateAvailable ? h('div', { className: 'mkts-selfupdate' },
+      h('span', { style: { flex: 1 } }, fmt('selfUpdate', { cur: data.self.version, latest: data.self.latestVersion })),
+      h('button', {
+        className: 'mkts-cmdbtn mkts-cmdbtn-primary',
+        disabled: opActive,
+        onClick: () => openOp('update', data.self.name, data.self.name, 'web'),
+      }, t('updateBtn')),
+    ) : null,
+    data.phase === 'loading' ? h('div', null, t('loading')) : null,
+    data.phase === 'error' ? h('div', { className: 'mkts-err' }, t('fetchFail')) : null,
+    installed.length === 0 && data.phase === 'ready' ? h('div', { className: 'mkts-hint' }, t('noInstalled')) : null,
+    installed.map((p: any) => h('div', { key: p.name, className: 'mkts-item' },
+      h('div', { className: 'mkts-main' },
+        h('h3', null,
+          p.name,
+          p.version ? h('span', { className: 'mkts-by' }, 'v' + p.version) : null,
+          p.updateAvailable ? h('span', { className: 'mkts-state mkts-state-inactive' }, t('updTo').replace('{latest}', String(p.latestVersion ?? '?'))) : null,
+        ),
+        p.spec ? h('div', { className: 'mkts-meta' }, h('span', null, t('specNote') + ': ' + String(p.spec))) : null,
+      ),
+      h('div', { className: 'mkts-actions' },
+        h('span', { className: 'mkts-state ' + (p.enabled ? 'mkts-state-on' : 'mkts-state-inactive') },
+          p.enabled ? t('active') : t('inactive')),
+        h('button', {
+          className: 'mkts-cmdbtn' + (p.enabled ? '' : ' mkts-cmdbtn-primary'),
+          disabled: opActive || toggling === p.name,
+          onClick: () => toggle(p),
+        }, toggling === p.name ? t('toggling') : (p.enabled ? t('disable') : t('enable'))),
+        p.updateAvailable ? h('button', {
+          className: 'mkts-cmdbtn',
+          disabled: opActive,
+          onClick: () => openOp('update', p.name, p.name, 'web'),
+        }, t('updateBtn')) : null,
+        h('button', {
+          className: 'mkts-cmdbtn mkts-cmdbtn-danger',
+          disabled: opActive,
+          onClick: () => openOp('uninstall', p.name, p.name, 'web'),
+        }, t('uninstall')),
+      ),
+    )),
+    builtin.length > 0 ? h('div', { className: 'mkts-builtin' },
+      h('button', { className: 'mkts-cmdbtn', onClick: () => setShowBuiltin(!showBuiltin) },
+        (showBuiltin ? t('collapse') : t('builtin')) + ' (' + builtin.length + ')'),
+      showBuiltin ? builtin.map((p: any) => h('div', { key: p.name, className: 'mkts-builtin-row' },
+        h('span', null, p.name),
+        h('span', { className: 'mkts-by' }, p.version ? 'v' + p.version : ''),
+      )) : null,
+    ) : null,
+  )
+}
+
 // ── Plugin body ──────────────────────────────────────────────────────────────
 export const inject = ['slots']
 
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: ClientContext, config: Record<string, unknown> = {}): void {
   const slots = ctx.slots
   if (slots === undefined) return
+  const perPage = Number(config?.perPage)
+  if (Number.isInteger(perPage) && perPage >= 1 && perPage <= 100) MARKET_PER_PAGE = perPage
 
   // Module-level op bus: resume a running op from a prior page load and wire
   // the terminal side effect (refresh installed state / hot reload page).
@@ -641,6 +758,12 @@ export function apply(ctx: ClientContext): void {
     MarketPanel,
   ))
 
+  // The dedicated Installed tab: third-party plugins with manage actions.
+  slots.inject('settings.plugins.tab', () => slots.register(
+    { name: 'settings.plugins.tab', id: 'installed', order: 6, label: () => t('installedTab') },
+    InstalledPanel,
+  ))
+
   // The startup onboarding step (first-run plugin market on the launch page).
   slots.inject('settings.onboarding', () => slots.register(
     { name: 'settings.onboarding', id: 'plugin-market', order: 10 },
@@ -654,4 +777,4 @@ export function apply(ctx: ClientContext): void {
   ))
 }
 
-export { GlobalProgress, MarketPanel, MarketOnboarding }
+export { GlobalProgress, MarketPanel, MarketOnboarding, InstalledPanel }
