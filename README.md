@@ -1,5 +1,17 @@
 # dsh-webui-market-plugin-plus
 
+> **Fork / 分叉说明（不是原创）** — 本项目是社区插件
+> **[`@sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)**
+> 的一个 **fork（分支）**，基于其 MIT 代码二次开发，**原作者为 Sanqi-normal**。
+> 本仓库的维护者**并非原作者**；请把原作者应有的致谢与 credit 归于
+> [`@Sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)。
+>
+> **Attribution / Credit**: This is a **fork** — not an original project. Derived
+> from the MIT-licensed plugin
+> [`@Sanqi-normal/dsh-webui-market-plugin`](https://github.com/Sanqi-normal/dsh-webui-market-plugin)
+> by **Sanqi-normal** (the original author). This fork's maintainer is **not** the
+> original author; please attribute the original work to the upstream repo above.
+
 在 dsh web GUI 内部的社区插件市场 —— **`@sanqi-normal/dsh-webui-market-plugin` 的 fork**，重点改进了安装体验。
 
 An in-harness community plugin market for the dsh web GUI — a **fork of

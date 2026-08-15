@@ -1,6 +1,11 @@
 MIT License
 
-Copyright (c) 2026 Sanqi-normal
+Copyright (c) 2026 Sanqi-normal (original author)
+
+This is a fork of https://github.com/Sanqi-normal/dsh-webui-market-plugin
+(also MIT). Additional derivative work by the fork maintainer (condaThinker)
+is distributed under the same MIT license; the original copyright remains with
+Sanqi-normal.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

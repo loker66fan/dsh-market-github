@@ -3,6 +3,18 @@
   "description": "In-harness community plugin market for the dsh web GUI — fork of @sanqi-normal/dsh-webui-market-plugin. Browse awesome-dsh-plugin.com, install/uninstall with a global never-lost progress indicator (Google-Play style), terminate installs, and enable/disable installed plugins.",
   "version": "0.2.0",
   "type": "module",
+  "author": {
+    "name": "Sanqi-normal (original author), forked by condaThinker",
+    "url": "https://github.com/Sanqi-normal/dsh-webui-market-plugin"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/condaThinker/dsh-webui-market-plugin-plus.git"
+  },
+  "homepage": "https://github.com/condaThinker/dsh-webui-market-plugin-plus",
+  "bugs": {
+    "url": "https://github.com/condaThinker/dsh-webui-market-plugin-plus/issues"
+  },
   "main": "lib/host.js",
   "exports": {
     ".": "./lib/host.js",
