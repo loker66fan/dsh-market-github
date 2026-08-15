@@ -24,7 +24,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import { MARKET_CSS } from './market-css.ts'
 import {
   apiOp, closeOpState, executeOpState, getOp, killCurrentOp, minimizeOp, openOp,
-  restoreOp, resumeOp, setOnTerminal, setOpState, setSkipCheck, subscribeOp, type OpState,
+  restoreOp, resumeOp, setOnTerminal, setOpLostMessage, setOpState, setSkipCheck, subscribeOp, type OpState,
 } from './op-bus.ts'
 
 // ── Locale ───────────────────────────────────────────────────────────────────
@@ -72,6 +72,8 @@ const STR: Record<string, Record<string, string>> = {
     totalResults: '共 {n} 个',
     updatedAt: '更新于 {d}',
     quotaHint: 'GitHub 搜索剩余配额（次/分钟）；配置 GITHUB_TOKEN 可提高',
+    opLost: '任务状态丢失（服务可能已重启或任务被其他操作接管），请刷新页面后重试',
+    waiting: '已等待 {s}s…',
   },
   en: {
     search: 'Search plugins…', all: 'All', instFilter: 'Installed', detail: 'Details', collapse: 'Collapse',
@@ -110,6 +112,8 @@ const STR: Record<string, Record<string, string>> = {
     totalResults: '{n} total',
     updatedAt: 'Updated {d}',
     quotaHint: 'GitHub search quota remaining (per minute); set GITHUB_TOKEN to raise it',
+    opLost: 'Task state lost (the server may have restarted or another task took over); refresh the page and retry',
+    waiting: 'Waited {s}s…',
   },
 }
 const t = (k: string): string => { const m = STR[LOCALE]; return (m && m[k] !== undefined) ? m[k] : (STR['zh'][k] !== undefined ? STR['zh'][k] : k) }
@@ -188,12 +192,22 @@ function GlobalProgress(): ReactNode {
   const [, force] = useState(0)
   const [restarting, setRestarting] = useState(false)
   useEffect(() => subscribeOp(() => force((n) => n + 1)), [])
+  // Local 1s ticker: the starting phase has no server-side elapsed updates,
+  // and without this the pill's timer would sit frozen at 0s.
+  const [, tick] = useState(0)
+  useEffect(() => {
+    const iv = setInterval(() => tick((n) => n + 1), 1000)
+    return () => { clearInterval(iv) }
+  }, [])
   const op = getOp()
   if (!op || op.phase === 'confirm') return null
 
   const running = op.phase === 'starting' || op.phase === 'running'
   const colored = op.phase === 'done' ? (op.ok ? 'done' : 'err') : ''
   const kindLabel = op.kind === 'install' ? t('install') : op.kind === 'update' ? t('updateBtn') : t('uninstall')
+  const elapsedS = op.phase === 'starting'
+    ? Math.max(0, Math.round((Date.now() - (op.startingAt || Date.now())) / 1000))
+    : Math.round((op.elapsedMs || 0) / 1000)
 
   const title = running
     ? (kindLabel + ' · ' + op.label)
@@ -204,7 +218,7 @@ function GlobalProgress(): ReactNode {
       : ''
 
   const meta = running
-    ? fmt('progMetaCmd', { kind: kindLabel, label: op.label, s: Math.round((op.elapsedMs || 0) / 1000) })
+    ? fmt('progMetaCmd', { kind: kindLabel, label: op.label, s: elapsedS })
     : (op.status === 'killed' ? t('stKilled') : op.status === 'timeout' ? t('stTimeout')
       : (op.kind === 'install' ? (op.hot ? t('progDone') : t('restartHint')) : ''))
 
@@ -261,7 +275,15 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
   const [page, setPage] = useState(1)
   const [open, setOpen] = useState<string | null>(null)
   const [, force] = useState(0)
+  // Local 1s ticker: keeps the starting-phase waiting timer moving between
+  // (infrequent) op-bus updates.
+  const [, tick] = useState(0)
   const op = getOp()
+
+  useEffect(() => {
+    const iv = setInterval(() => tick((n) => n + 1), 1000)
+    return () => { clearInterval(iv) }
+  }, [])
 
   useEffect(() => {
     const off = subscribeOp(() => force((n) => n + 1))
@@ -414,7 +436,8 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
       ) : null,
       op.phase === 'starting' ? h('div', { className: 'mkts-cmdrow' },
         h('span', { className: 'mkts-spin' }), h('span', { style: { fontSize: 12 } },
-          (op.kind === 'install' && op.profile === 'web' && !op.skipCheck) ? t('probing') : t('submit')),
+          ((op.kind === 'install' && op.profile === 'web' && !op.skipCheck) ? t('probing') : t('submit'))
+            + ' · ' + fmt('waiting', { s: Math.max(0, Math.round((Date.now() - (op.startingAt || Date.now())) / 1000)) })),
       ) : null,
       op.phase === 'running' ? h('div', null,
         h('div', { className: 'mkts-cmdrow' },
@@ -599,6 +622,7 @@ export function apply(ctx: ClientContext): void {
       setTimeout(() => { try { location.reload() } catch {} }, 1600)
     }
   })
+  setOpLostMessage(t('opLost'))
 
   ctx.effect(() => {
     const id = 'dsh-market-style'

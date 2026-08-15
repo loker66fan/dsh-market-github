@@ -22,6 +22,7 @@ export interface OpState {
   exitCode?: number | null
   minimized: boolean
   elapsedMs?: number
+  startingAt?: number
   timeoutMs?: number
   ok?: boolean
   hot?: boolean
@@ -73,13 +74,25 @@ export function closeOpState(): void {
 
 function stopPolling(): void { pollStop = true }
 
+/** Localized message for a lost op state; set by apply(). */
+let opLostMessage = '任务状态丢失（服务可能已重启或任务被其他操作接管），请刷新页面后重试'
+export function setOpLostMessage(s: string): void { opLostMessage = s }
+
 function pollOp(opId: string): void {
   const step = () => {
     if (pollStop) return
     apiOp('op', { opId }).then((r) => {
       if (pollStop) return
       const o = r && r.ok ? r.op : null
-      if (!o) return
+      if (!o) {
+        // The server no longer knows this op id (another op took over the
+        // single-op slot, or the server restarted). Without this the poll
+        // loop dies silently and the UI freezes on "running" forever.
+        setOpState((prev) => (prev && prev.opId === opId
+          ? { ...prev, phase: 'done', status: 'failed', ok: false, output: opLostMessage }
+          : prev))
+        return
+      }
       setOpState((prev) => {
         if (!prev || prev.opId !== opId) return prev
         if (o.status === 'running') {
@@ -113,7 +126,7 @@ export function setOnTerminal(cb: ((o: OpState) => void) | null): void { onTermi
 export function executeOpState(binPath: string): void {
   const cur = op
   if (!cur) return
-  setOpState({ phase: 'starting', output: '' })
+  setOpState({ phase: 'starting', output: '', startingAt: Date.now() })
   const params = cur.kind === 'install'
     ? { source: cur.target, profile: cur.profile, binPath, label: cur.label, skipCheck: !!cur.skipCheck }
     : cur.kind === 'update'
