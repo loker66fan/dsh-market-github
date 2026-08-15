@@ -616,16 +616,41 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
 // step wraps the same MarketPanel in a full-screen modal so a fresh user meets
 // the market during first run (before any session exists), with a Done/Skip
 // action that never blocks onboarding.
+//
+// The coordinator only remembers completions for the current page load, so the
+// step persists its own "seen" flag in localStorage: on later loads it renders
+// null and completes itself immediately instead of popping up again. (Same
+// pattern as the in-tree welcome/model onboarding steps, which persist their
+// acknowledgement through settings.)
+const ONBOARDING_DONE_KEY = 'mktsOnboardingDone'
+
 function MarketOnboarding(props: { complete?: () => void }): ReactNode {
+  const [done, setDone] = useState<boolean>(() => {
+    try { return localStorage.getItem(ONBOARDING_DONE_KEY) === '1' } catch { return false }
+  })
+
+  // Already seen on a previous load: advance the coordinator without showing
+  // anything, so the market never blocks the flow (and never pops up again).
+  useEffect(() => {
+    if (done && props.complete) props.complete()
+  }, [])
+
+  const finish = (): void => {
+    try { localStorage.setItem(ONBOARDING_DONE_KEY, '1') } catch {}
+    setDone(true)
+    if (props.complete) props.complete()
+  }
+
+  if (done) return null
   return h('div', { className: 'mkts-ob' },
-    h('div', { className: 'mkts-ob-scrim', onClick: () => { if (props.complete) props.complete() } }),
+    h('div', { className: 'mkts-ob-scrim', onClick: finish }),
     h('div', { className: 'mkts-ob-card', onClick: (e: MouseEvent) => e.stopPropagation() },
       h('div', { className: 'mkts-ob-header' },
         h('div', { className: 'mkts-ob-title' },
           h('h2', null, t('marketTitle')),
           h('p', null, t('marketSubtitle')),
         ),
-        h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-primary', onClick: () => { if (props.complete) props.complete() } }, t('done')),
+        h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-primary', onClick: finish }, t('done')),
       ),
       h('div', { className: 'mkts-ob-body' }, h(MarketPanel, { embedded: true })),
     ),
