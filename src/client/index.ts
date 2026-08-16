@@ -13,6 +13,7 @@
 // The op bus state itself is module-level and resumed at apply time, so a
 // refresh or tab switch never loses an in-flight op.
 import { createElement as h, Fragment, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { ReactElement, ReactNode } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only contributions: pull the settings SlotMap merge (so
@@ -60,7 +61,8 @@ const STR: Record<string, Record<string, string>> = {
     toggling: '切换中…',
     progRunning: '安装进行中', progDone: '安装完成', progErr: '安装失败',
     restartBanner: '插件状态已变更，重启 Web 服务后生效', restartHint: '重启后生效',
-    restartNow: '立即重启', restarting: '重启中…',
+    restartNow: '立即重启', restarting: '重启中…', restartTimeout: '重启超时，请手动刷新页面',
+    opFailedRetry: '操作失败，请重试',
     progMetaCmd: '{kind} {label} · {s}s',
     noActive: '未安装',
     marketTitle: '插件商城',
@@ -112,7 +114,8 @@ const STR: Record<string, Record<string, string>> = {
     toggling: 'Switching…',
     progRunning: 'Install in progress', progDone: 'Install done', progErr: 'Install failed',
     restartBanner: 'Plugin state changed — restart the web server to activate', restartHint: 'Restart required',
-    restartNow: 'Restart now', restarting: 'Restarting…',
+    restartNow: 'Restart now', restarting: 'Restarting…', restartTimeout: 'Restart timed out — refresh the page manually',
+    opFailedRetry: 'Operation failed — please retry',
     progMetaCmd: '{kind} {label} · {s}s',
     noActive: 'Not installed',
     marketTitle: 'Plugin Market',
@@ -198,11 +201,6 @@ function isActive(plugin: any, installedMap: any): boolean {
     || (Array.isArray(state.clientRows) && state.clientRows.some((b: string) => norm(b) === needle))
 }
 
-/** Active-state descriptor for installed cards. */
-function actClass(plugin: any, installed: any, active: boolean): string {
-  return active ? 'on' : 'inactive'
-}
-
 // ── GlobalProgress: frame-wide shell.overlay indicator ───────────────────────
 // Stays mounted app-wide, so an op's progress (and its kill button) are never
 // lost by navigating to another project/section. Also shows a restart banner
@@ -210,27 +208,67 @@ function actClass(plugin: any, installed: any, active: boolean): string {
 let reloadAttempts = 0
 
 /** Poll the origin until the restarted server answers, then reload the page. */
-function pollReload(): void {
+function pollReload(onGiveUp?: () => void): void {
   reloadAttempts += 1
-  if (reloadAttempts > 60) { reloadAttempts = 0; return } // give up after ~2 min
+  if (reloadAttempts > 60) { reloadAttempts = 0; if (onGiveUp) onGiveUp(); return } // give up after ~2 min
   fetch(window.location.origin + '/', { cache: 'no-store' }).then((r) => {
     if (r.ok) { try { location.reload() } catch {} }
-    else setTimeout(pollReload, 2000)
-  }).catch(() => { setTimeout(pollReload, 2000) })
+    else setTimeout(() => pollReload(onGiveUp), 2000)
+  }).catch(() => { setTimeout(() => pollReload(onGiveUp), 2000) })
+}
+
+// ── Shared modal a11y helper ─────────────────────────────────────────────────
+// Per the host contract, a modal step OWNS the #root inert attribute for as
+// long as it is mounted: set on mount, removed on unmount. Reference-counted
+// because two surfaces can overlap (the onboarding modal + the op modal inside
+// its embedded MarketPanel): a plain set/remove pair would have one modal's
+// unmount strip the attribute the other still owns. Kept unexported and named
+// outside the test's extracted-function set (tests/client.test.mjs extracts
+// repoNameOf/repoOfValue/installedPkgName/isActive/isInstalled only).
+let rootInertCount = 0
+function modalInert(): () => void {
+  const root = typeof document !== 'undefined' ? document.getElementById('root') : null
+  rootInertCount += 1
+  if (root && rootInertCount === 1) root.setAttribute('inert', '')
+  return () => {
+    rootInertCount = Math.max(0, rootInertCount - 1)
+    if (root && rootInertCount === 0) root.removeAttribute('inert')
+  }
+}
+
+/** Modal surface helper: owns #root inert while its surface is up. */
+function useModalInert(active: boolean): void {
+  useEffect(() => { if (active) return modalInert() }, [active])
+}
+
+/** Render a modal surface OUTSIDE #root. modalInert sets `inert` on #root for
+ *  the whole modal lifetime, and inert disables the entire subtree — a modal
+ *  mounted inside #root would have its own buttons dead (for the onboarding
+ *  modal, whose Escape is intentionally a no-op, an unrecoverable takeover).
+ *  Portaling to document.body keeps the dialog interactive while #root stays
+ *  inert; portaled nodes remain in the React tree, so refs/focus still work.
+ *  SSR guard mirrors modalInert's (the client only runs in a browser). */
+function portalModal(tree: ReactNode): ReactNode {
+  return typeof document !== 'undefined' ? createPortal(tree, document.body) : tree
 }
 
 function GlobalProgress(): ReactNode {
   const [, force] = useState(0)
   const [restarting, setRestarting] = useState(false)
+  const [restartError, setRestartError] = useState<string | null>(null)
   useEffect(() => subscribeOp(() => force((n) => n + 1)), [])
+  const op = getOp()
   // Local 1s ticker: the starting phase has no server-side elapsed updates,
-  // and without this the pill's timer would sit frozen at 0s.
+  // and without this the pill's timer would sit frozen at 0s. Gated on an
+  // adopted, non-terminal op — a null/done op runs no interval (deps flip the
+  // effect on/off; the ticker only matters while a timer is displayed).
   const [, tick] = useState(0)
+  const tickerOn = !!op && op.phase !== 'done'
   useEffect(() => {
+    if (!tickerOn) return
     const iv = setInterval(() => tick((n) => n + 1), 1000)
     return () => { clearInterval(iv) }
-  }, [])
-  const op = getOp()
+  }, [tickerOn])
   if (!op || op.phase === 'confirm') return null
 
   const running = op.phase === 'starting' || op.phase === 'running'
@@ -259,16 +297,22 @@ function GlobalProgress(): ReactNode {
   const requestRestart = (): void => {
     if (restarting) return
     setRestarting(true)
+    setRestartError(null)
     apiOp('restart').then((r) => {
-      if (r && r.ok) { pollReload(); return }
+      if (r && r.ok) { pollReload(() => { setRestarting(false); setRestartError(t('restartTimeout')) }); return }
+      // Non-ok restart response: re-enable the button and surface the error.
       setRestarting(false)
-    }).catch(() => { setRestarting(false) })
+      setRestartError(String((r && r.error) || t('opFailed')))
+    }).catch((e) => {
+      setRestarting(false)
+      setRestartError(String((e && e.message) || t('opFailed')))
+    })
   }
 
   return h('div', { className: 'mkts mkts-prog' },
     needRestart
       ? h('div', { className: 'mkts-restart' },
-          h('span', { style: { flex: 1 } }, t('restartBanner')),
+          h('span', { style: { flex: 1 } }, restartError ? h('span', { className: 'mkts-live-bad' }, restartError) : t('restartBanner')),
           h('button', { className: 'mkts-restart-btn', disabled: restarting, onClick: requestRestart },
             restarting ? t('restarting') : t('restartNow')),
         )
@@ -314,10 +358,15 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
   const topRef = useRef<HTMLDivElement | null>(null)
   const op = getOp()
 
+  // Same gate as GlobalProgress: the 1s ticker only matters while an adopted
+  // op is in a live phase (the waiting/elapsed displays need it); no interval
+  // runs when there is no op.
+  const tickerOn = !!op && op.phase !== 'done'
   useEffect(() => {
+    if (!tickerOn) return
     const iv = setInterval(() => tick((n) => n + 1), 1000)
     return () => { clearInterval(iv) }
-  }, [])
+  }, [tickerOn])
 
   useEffect(() => {
     const off = subscribeOp(() => force((n) => n + 1))
@@ -344,6 +393,11 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
       .then((entries) => setData((d: any) => ({ ...d, updates: Object.fromEntries(entries) })))
       .catch(() => setData((d: any) => ({ ...d, updates: null })))
   }
+  // The once-registered op subscriber below captures the FIRST render's
+  // loadInstalled (with empty data.plugins); route it through a ref so it
+  // always calls the latest closure.
+  const loadInstalledRef = useRef(loadInstalled)
+  loadInstalledRef.current = loadInstalled
 
   useEffect(() => { probe() }, [])
 
@@ -373,7 +427,10 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
         return
       }
       const plugins = r.plugins || []
-      setData((d: any) => ({ ...d, phase: 'ready', notice: null, plugins, cats: [], total: typeof r.total === 'number' ? r.total : null, rate: r.rate ?? null }))
+      // dataPage: the page THIS list corresponds to — set only on success, so
+      // a failed page turn leaves the pager showing the still-rendered page
+      // instead of desyncing to the page that never loaded.
+      setData((d: any) => ({ ...d, phase: 'ready', notice: null, plugins, cats: [], total: typeof r.total === 'number' ? r.total : null, rate: r.rate ?? null, dataPage: pageNum }))
       loadInstalled(plugins)
     }).catch((e) => {
       if (seq !== searchSeq.current) return // stale failure
@@ -393,10 +450,15 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
     return () => { clearTimeout(timer) }
   }, [query, sortBy])
 
+  // The page the currently rendered list corresponds to (falls back to `page`
+  // for legacy state without dataPage). The pager renders this, not `page`, so
+  // a failed fetch keeps the pager honest about what is on screen.
+  const shownPage = typeof data.dataPage === 'number' ? data.dataPage : page
+
   // Turn to a specific page (1-based), clamped to the available range.
   const goPage = (n: number): void => {
     const total = typeof data.total === 'number' ? data.total : (data.plugins || []).length
-    if (n < 1 || n > pageCount(total) || n === page) return
+    if (n < 1 || n > pageCount(total) || n === shownPage) return
     setPage(n)
     runSearch(query, sortBy, n)
     topRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
@@ -406,15 +468,21 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
   // enable-disable change the profile).
   useEffect(() => subscribeOp((o) => {
     if (!o || o.phase !== 'done') return
-    loadInstalled()
+    loadInstalledRef.current()
   }), [])
 
+  // Per-row in-flight toggle state: keyed by plugin url, so row A's response
+  // never clears row B's disable state (a single string clobbered whatever
+  // else was pending).
+  const [togglingSet, setTogglingSet] = useState<Record<string, true>>({})
   const toggle = (p: any, active: boolean): void => {
     const pkgName = installedPkgName(p, data.installed && data.installed[p.profile || 'web'])
     if (!pkgName) { openOp('install', p.source, p.name, p.profile); return }
-    setToggling(p.url)
+    const key = p.url
+    setTogglingSet((s) => ({ ...s, [key]: true }))
+    const settle = (): void => setTogglingSet((s) => { const next = { ...s }; delete next[key]; return next })
     apiOp('toggleActive', { profile: p.profile, name: pkgName, enabled: !active }).then((r) => {
-      setToggling(null)
+      settle()
       if (r && r.ok) {
         // Same message-discriminated copy + neutral styling as InstalledPanel.
         const toast = toggleOkToast(r)
@@ -423,9 +491,12 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
       } else {
         setData((d: any) => ({ ...d, toast: String((r && r.error) || t('opFailed')), toastKind: 'err' }))
       }
-    }).catch(() => { setToggling(null) })
+    }).catch(() => {
+      settle()
+      // Silent catch hid network failures entirely; surface a retry hint.
+      failNotice(t('opFailedRetry'))
+    })
   }
-  const [toggling, setToggling] = useState<string | null>(null)
 
   // The server already scopes results to the query + sort; the client only
   // applies the "installed" filter locally (and keeps the server order).
@@ -455,8 +526,28 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
 
   const opTitle = (o: OpState): string => (o.kind === 'install' ? t('install') : o.kind === 'update' ? t('updateBtn') : t('uninstall')) + ' ' + o.label
 
-  const modal = op && !op.minimized ? h('div', { className: 'mkts-modal-bg', onClick: () => { if (op.phase === 'running' || op.phase === 'starting') minimizeOp(); else closeOpState() } },
-    h('div', { className: 'mkts-modal', onClick: (e: MouseEvent) => e.stopPropagation() },
+  // Modal a11y: while the op modal is open it owns #root inert, Escape
+  // minimizes (never kills — the destructive action keeps its explicit
+  // button), and initial focus lands on the dialog card.
+  const modalOpen = !!op && !op.minimized
+  const modalRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => { if (modalOpen) return modalInert() }, [modalOpen])
+  useEffect(() => {
+    if (!modalOpen) return
+    modalRef.current?.focus()
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key !== 'Escape') return
+      const cur = getOp()
+      if (!cur || cur.minimized) return
+      if (cur.phase === 'running' || cur.phase === 'starting') minimizeOp()
+      else closeOpState()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => { window.removeEventListener('keydown', onKey) }
+  }, [modalOpen])
+
+  const modal = op && !op.minimized ? portalModal(h('div', { className: 'mkts-modal-bg', onClick: () => { if (op.phase === 'running' || op.phase === 'starting') minimizeOp(); else closeOpState() } },
+    h('div', { className: 'mkts-modal', role: 'dialog', 'aria-modal': 'true', tabIndex: -1, ref: modalRef, onClick: (e: MouseEvent) => e.stopPropagation() },
       h('h4', null, opTitle(op)),
       h('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', fontFamily: 'ui-monospace,monospace' } },
         op.kind === 'uninstall'
@@ -479,6 +570,11 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
         h('span', { className: 'mkts-spin' }), h('span', { style: { fontSize: 12 } },
           ((op.kind === 'install' && op.profile === 'web' && !op.skipCheck) ? t('probing') : t('submit'))
             + ' · ' + fmt('waiting', { s: Math.max(0, Math.round((Date.now() - (op.startingAt || Date.now())) / 1000)) })),
+        // Kill during the starting window too: without this the 1-6 min
+        // resolveInstallSpec phase has no escape, and killing there is exactly
+        // the race the op-bus generation guard handles.
+        h('button', { className: 'mkts-cmdbtn', onClick: minimizeOp }, t('min')),
+        h('button', { className: 'mkts-cmdbtn mkts-cmdbtn-danger', onClick: killCurrentOp }, t('kill')),
       ) : null,
       op.phase === 'running' ? h('div', null,
         h('div', { className: 'mkts-cmdrow' },
@@ -502,7 +598,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
         op.output ? h('div', { className: 'mkts-log' }, op.output) : null,
         h('div', { className: 'mkts-cmdrow' }, h('button', { className: 'mkts-cmdbtn', onClick: closeOpState }, t('close'))),
       ) : null,
-    )) : null
+    ))) : null
 
   const liveChip = op && op.minimized ? h('button', {
     className: 'mkts-livechip' + (op.phase === 'done' ? (op.ok ? ' mkts-livechip-done' : ' mkts-livechip-err') : ''),
@@ -514,6 +610,12 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
   ) : null
 
   const toast = data.toast
+  // Toasts self-clear after 6s (with cleanup on unmount/re-toast).
+  useEffect(() => {
+    if (!toast) return
+    const iv = setTimeout(() => setData((d: any) => (d.toast === toast ? { ...d, toast: null } : d)), 6000)
+    return () => { clearTimeout(iv) }
+  }, [toast])
 
   return h('div', { className: 'mkts', ref: topRef },
     toast ? h('div', { className: data.toastKind === 'ok' ? 'mkts-toast' : 'mkts-err' }, toast) : null,
@@ -554,7 +656,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
         }, t('instFilter'), ' ', h('small', null, installedCount)),
         h('div', { className: 'mkts-sort' },
           [['stars', t('sortHot')], ['updated', t('sortNew')]].map(([key, label]) =>
-            h('button', { key, className: sortBy === key ? 'on' : '', onClick: () => setSortBy(key) }, label))),
+            h('button', { key, className: sortBy === key ? 'mkts-on' : '', onClick: () => setSortBy(key) }, label))),
       ),
     ),
     data.phase === 'loading' ? h('div', null, t('loading')) : null,
@@ -566,7 +668,7 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
         const active = isActive(p, data.installed)
         const isOpen = open === p.url
         const opActive = !!(op && op.phase !== 'done')
-        const isToggling = toggling === p.url
+        const isToggling = !!togglingSet[p.url]
         return h('div', { key: p.url, className: 'mkts-item' },
           h('span', { className: 'mkts-no' }, '№ ' + String(i + 1).padStart(2, '0')),
           h('div', { className: 'mkts-main' },
@@ -623,9 +725,9 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
       }),
     )) : null,
     data.phase === 'ready' && totalPages > 1 ? h('div', { className: 'mkts-pager' },
-      h('button', { className: 'mkts-cmdbtn', disabled: page <= 1, onClick: () => goPage(page - 1) }, t('prev')),
-      h('span', { className: 'mkts-pager-info' }, page + ' / ' + totalPages),
-      h('button', { className: 'mkts-cmdbtn', disabled: page >= totalPages, onClick: () => goPage(page + 1) }, t('next')),
+      h('button', { className: 'mkts-cmdbtn', disabled: shownPage <= 1, onClick: () => goPage(shownPage - 1) }, t('prev')),
+      h('span', { className: 'mkts-pager-info' }, shownPage + ' / ' + totalPages),
+      h('button', { className: 'mkts-cmdbtn', disabled: shownPage >= totalPages, onClick: () => goPage(shownPage + 1) }, t('next')),
     ) : null,
     data.phase === 'ready' && filtered.length === 0 ? h('div', { className: 'mkts-hint' }, t('noMatch')) : null,
   )
@@ -646,9 +748,16 @@ function MarketPanel(props: { embedded?: boolean }): ReactElement {
 const ONBOARDING_DONE_KEY = 'mktsOnboardingDone'
 
 function MarketOnboarding(props: { complete?: () => void }): ReactNode {
-  const [done, setDone] = useState<boolean>(() => {
-    try { return localStorage.getItem(ONBOARDING_DONE_KEY) === '1' } catch { return false }
-  })
+  // localStorage first, sessionStorage fallback: in strict privacy mode
+  // localStorage.setItem throws, which used to re-show the onboarding modal on
+  // EVERY page load. sessionStorage usually still works there, turning the
+  // loop into at-worst once per session.
+  const readDone = (): boolean => {
+    try { if (localStorage.getItem(ONBOARDING_DONE_KEY) === '1') return true } catch {}
+    try { if (sessionStorage.getItem(ONBOARDING_DONE_KEY) === '1') return true } catch {}
+    return false
+  }
+  const [done, setDone] = useState<boolean>(readDone)
 
   // Already seen on a previous load: advance the coordinator without showing
   // anything, so the market never blocks the flow (and never pops up again).
@@ -658,14 +767,22 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
 
   const finish = (): void => {
     try { localStorage.setItem(ONBOARDING_DONE_KEY, '1') } catch {}
+    try { sessionStorage.setItem(ONBOARDING_DONE_KEY, '1') } catch {}
     setDone(true)
     if (props.complete) props.complete()
   }
 
+  // Modal a11y (op-modal counterpart): dialog role + #root inert ownership +
+  // initial focus on the card. Escape intentionally does nothing — this is a
+  // sole-path onboarding step (the Done/Skip button is the only way out).
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  useModalInert(!done)
+  useEffect(() => { if (!done) cardRef.current?.focus() }, [done])
+
   if (done) return null
-  return h('div', { className: 'mkts-ob' },
+  return portalModal(h('div', { className: 'mkts-ob' },
     h('div', { className: 'mkts-ob-scrim', onClick: finish }),
-    h('div', { className: 'mkts-ob-card', onClick: (e: MouseEvent) => e.stopPropagation() },
+    h('div', { className: 'mkts-ob-card', role: 'dialog', 'aria-modal': 'true', tabIndex: -1, ref: cardRef, onClick: (e: MouseEvent) => e.stopPropagation() },
       h('div', { className: 'mkts-ob-header' },
         h('div', { className: 'mkts-ob-title' },
           h('h2', null, t('marketTitle')),
@@ -675,7 +792,7 @@ function MarketOnboarding(props: { complete?: () => void }): ReactNode {
       ),
       h('div', { className: 'mkts-ob-body' }, h(MarketPanel, { embedded: true })),
     ),
-  )
+  ))
 }
 
 // ── InstalledPanel: the dedicated 已安装 tab ──────────────────────────────────
@@ -719,7 +836,9 @@ function liveBadge(p: any): ReactElement {
 
 function InstalledPanel(): ReactElement {
   const [data, setData] = useState<any>({ phase: 'loading', plugins: [], self: null, toast: null })
-  const [toggling, setToggling] = useState<string | null>(null)
+  // Per-row in-flight toggle state (keyed by plugin name): row A's response
+  // must not clear row B's disable state.
+  const [togglingSet, setTogglingSet] = useState<Record<string, true>>({})
   const [showBuiltin, setShowBuiltin] = useState(false)
 
   const load = (): void => {
@@ -740,9 +859,11 @@ function InstalledPanel(): ReactElement {
   }), [])
 
   const toggle = (row: any): void => {
-    setToggling(row.name)
+    const key = row.name
+    setTogglingSet((s) => ({ ...s, [key]: true }))
+    const settle = (): void => setTogglingSet((s) => { const next = { ...s }; delete next[key]; return next })
     apiOp('toggleActive', { profile: 'web', name: row.name, enabled: !row.enabled }).then((r) => {
-      setToggling(null)
+      settle()
       if (r && r.ok) {
         // The host's message discriminator picks the copy (live vs restart);
         // success feedback is a neutral toast, not the red error style.
@@ -753,10 +874,17 @@ function InstalledPanel(): ReactElement {
         setData((d: any) => ({ ...d, toast: String((r && (r.error || r.output)) || t('opFailed')), toastKind: 'err' }))
       }
     }).catch((e) => {
-      setToggling(null)
+      settle()
       setData((d: any) => ({ ...d, toast: String((e && e.message) || t('opFailed')), toastKind: 'err' }))
     })
   }
+
+  // Toasts self-clear after 6s (with cleanup on unmount/re-toast).
+  useEffect(() => {
+    if (!data.toast) return
+    const iv = setTimeout(() => setData((d: any) => (d.toast === data.toast ? { ...d, toast: null } : d)), 6000)
+    return () => { clearTimeout(iv) }
+  }, [data.toast])
 
   const installed = (data.plugins || []).filter((p: any) => p.kind === 'installed')
   const builtin = (data.plugins || []).filter((p: any) => p.kind === 'builtin')
@@ -788,9 +916,9 @@ function InstalledPanel(): ReactElement {
         liveBadge(p),
         h('button', {
           className: 'mkts-cmdbtn' + (p.enabled ? '' : ' mkts-cmdbtn-primary'),
-          disabled: opActive || toggling === p.name,
+          disabled: opActive || !!togglingSet[p.name],
           onClick: () => toggle(p),
-        }, toggling === p.name ? t('toggling') : (p.enabled ? t('disable') : t('enable'))),
+        }, !!togglingSet[p.name] ? t('toggling') : (p.enabled ? t('disable') : t('enable'))),
         p.updateAvailable ? h('button', {
           className: 'mkts-cmdbtn',
           disabled: opActive,
@@ -834,7 +962,12 @@ export function apply(ctx: ClientContext, config: Record<string, unknown> = {}):
   resumeOp()
   setOnTerminal((o) => {
     if (o.kind === 'install' && o.ok && o.hot) {
-      setTimeout(() => { try { location.reload() } catch {} }, 1600)
+      // Fire-time re-check (same race guard as pollOp): if a fresh op took
+      // over during the delay window, cancel this reload.
+      setTimeout(() => {
+        const cur = getOp()
+        if (!cur || cur.opId === o.opId) { try { location.reload() } catch {} }
+      }, 1600)
     }
   })
   setOpLostMessage(t('opLost'))

@@ -2,17 +2,32 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, push-to-github]
   pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: typecheck + build + test (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    name: typecheck + build + test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # Explicit include list instead of a full os × node cross product:
+      # Windows only needs one representative cell (it guards path/shell/glob
+      # regressions), so we run ubuntu×{22,24} + windows×{24} = 3 cells to
+      # keep CI fast rather than 4.
       matrix:
-        node: [22, 24]
+        include:
+          - os: ubuntu-latest
+            node: 22
+          - os: ubuntu-latest
+            node: 24
+          - os: windows-latest
+            node: 24
     steps:
       - uses: actions/checkout@v4
 

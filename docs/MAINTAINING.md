@@ -35,6 +35,14 @@ git add -A && git commit -m "说明"
 
 > `lib/` 已提交（含构建产物），安装依赖它；改了 `src/` 就必须重建 `lib/` 一起提交。
 
+## devDeps 钉 rc.6、目标运行时 rc.5 的原因
+
+devDependencies 里 `@deepseek-ai/dsh-client-*` 钉在 `^0.1.0-rc.6`（当前最新已发布版），而目标 host 运行时是 rc.5。这是刻意的：
+
+- peerDependencies 是 `*`，安装/宿主解析不锁 host 版本；
+- 构建产物 `lib/client.js` 对 dsh 相关包**零运行时导入**（仅类型引用，打包时被擦除）——devDeps 只影响类型检查，不进入运行时；
+- 代价：rc.6 新增的 slot key 能通过类型检查，但 rc.5 运行时并不存在。因此代码里用到的 slot key / API 必须在 rc.5 中已存在（当前已核对：`settings.onboarding`、`settings.plugins.tab`、`shell.overlay`）。
+
 ## 推送到 GitHub（需要在你的账号下操作）
 
 本机默认没有可用 GitHub 认证，需要你配置后再推送：

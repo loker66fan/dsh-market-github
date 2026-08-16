@@ -21,16 +21,17 @@ An in-harness plugin market for the dsh web GUI: **startup-page onboarding entry
 
 ## 安装 Install
 
-已发布 npm（推荐，预构建、零授权）：
-
-```sh
-dsh plugin --profile web add dsh-market-github
-```
-
-从 GitHub 安装（本仓库提交了预构建的 `lib/`，无需任何安装期构建授权）：
+从 GitHub 安装（**推荐**——本仓库提交了预构建的 `lib/`，无需任何安装期构建授权）：
 
 ```sh
 dsh plugin --profile web add github:loker66fan/dsh-market-github
+```
+
+npm（**尚未发布 / 计划中**）：发布前 `dsh plugin --profile web add dsh-market-github` 会以 404 失败，请先用上面的 GitHub 源；发布到 npm 后此命令即可直接使用：
+
+```sh
+# 计划发布到 npm / planned npm publish（当前 404）
+dsh plugin --profile web add dsh-market-github
 ```
 
 本地开发链接：
@@ -107,7 +108,7 @@ npm run build      # 生成 lib/host.js + lib/client.js（提交进仓库）
 npm test           # node --test tests/*.test.mjs
 ```
 
-推送触发 GitHub Actions CI（Node 22/24 矩阵：typecheck + build + test，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)）。发布前自动跑 `npm run build && npm test`（`prepublishOnly`）。版本/分支约定见 [docs/MAINTAINING.md](docs/MAINTAINING.md)。
+推送 `main` / `push-to-github`（及针对 `main` 的 PR）触发 GitHub Actions CI（ubuntu × Node 22/24 + windows × Node 24：typecheck + build + test，见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)）。发布前自动跑 `npm run build && npm test`（`prepublishOnly`）。版本/分支约定见 [docs/MAINTAINING.md](docs/MAINTAINING.md)。
 
 ## 致谢 Credits
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Build script for the forked plugin. Produces lib/host.js (plain ESM via
-// tsc) and lib/client.js (browser bundle via tsdown) plus a host.d.ts.
+// tsc) and lib/client.js (browser bundle via tsdown).
 // Node-only; resolves tooling from the local node_modules/.bin.
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -32,10 +32,12 @@ run(process.execPath, [tool.tsc, '-p', 'tsconfig.client.json', '--noEmit'])
 // 2. Clean the previous host emit (client.js is produced by tsdown into lib/).
 rmSync(join(root, 'lib'), { recursive: true, force: true })
 
-// 3. Compile host (also emits host.js.map + host.d.ts).
+// 3. Compile host. The current tsconfigs emit neither host.d.ts nor
+// host.js.map (no declaration/sourceMap flags), so the rmSync calls below
+// are defensive no-ops — kept in case a tsconfig regains
+// declaration/sourceMap output and we need to keep the package lean again.
 console.log('\n[build] compile host → lib/…')
 run(process.execPath, [tool.tsc, '-p', 'tsconfig.host.json'])
-// We do not need a .d.ts for the host entry; drop it to keep the package lean.
 rmSync(join(root, 'lib', 'host.d.ts'), { force: true })
 rmSync(join(root, 'lib', 'host.d.ts.map'), { force: true })
 

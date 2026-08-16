@@ -10,11 +10,11 @@ First public release 🎉 — an in-harness **plugin market** for the dsh web GU
 ## 安装 Install
 
 ```sh
-# npm（推荐 / recommended）
-dsh plugin --profile web add dsh-market-github
-
-# 或 GitHub（仓库内置预构建 lib/，无需安装期构建授权 / prebuilt lib committed, no build consent needed）
+# GitHub（推荐 / recommended — 仓库内置预构建 lib/，无需安装期构建授权 / prebuilt lib committed, no build consent needed）
 dsh plugin --profile web add github:loker66fan/dsh-market-github
+
+# npm（尚未发布 / not yet published — 发布前该命令 404，请先用 GitHub 源；发布后可用）
+dsh plugin --profile web add dsh-market-github
 
 # 重启生效 / restart to apply
 dsh web
@@ -59,7 +59,7 @@ dsh web
 
 ## 校验 Checks
 
-GitHub Actions CI（Node 22/24 矩阵：typecheck + build + test）；`npm pack` 产物 7 文件 / ~50 kB。
+GitHub Actions CI（ubuntu × Node 22/24 + windows × Node 24：typecheck + build + test）；`npm pack` 产物 7 文件 / ~78 kB packed（解压后 ~282 kB / unpacked）。
 
 ---
 

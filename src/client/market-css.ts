@@ -25,7 +25,7 @@ export const MARKET_CSS = `
 .mkts-chip-on small{color:inherit;opacity:.8}
 .mkts-sort{display:flex;gap:2px;background:var(--dsw-alias-bg-layer-2);border-radius:8px;padding:2px;margin-left:auto;flex-shrink:0}
 .mkts-sort button{border:none;background:none;font:inherit;font-size:12px;color:var(--dsw-alias-label-secondary);padding:3px 10px;border-radius:6px;cursor:pointer;white-space:nowrap}
-.mkts-sort button.on{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3);font-weight:600}
+.mkts-sort button.mkts-on{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3);font-weight:600}
 .mkts-sec{padding-block:14px 8px;font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary);display:flex;align-items:baseline;gap:8px}
 .mkts-sec small{font-size:11px;color:var(--dsw-alias-label-tertiary);font-weight:400}
 .mkts-item{display:flex;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;margin-bottom:6px;background:var(--dsw-alias-bg-layer-3);transition:border-color .16s;align-items:flex-start}
@@ -99,8 +99,6 @@ export const MARKET_CSS = `
 .mkts-prog-open:hover{color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed)}
 /* Restart-to-apply toast banner (also frame-wide). */
 .mkts-restart{pointer-events:auto;display:flex;align-items:center;gap:10px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-static-deepseek-500);border-left:3px solid var(--dsw-static-deepseek-500);border-radius:10px;padding:9px 12px;box-shadow:0 8px 28px rgba(0,0,0,.25);font-size:12px;color:var(--dsw-alias-label-primary)}
-.mkts-restart-close{appearance:none;background:none;border:none;color:var(--dsw-alias-label-tertiary);font-size:14px;cursor:pointer;line-height:1;padding:2px 4px}
-.mkts-restart-close:hover{color:var(--dsw-alias-label-primary)}
 
 /* ── Onboarding (startup) plugin market modal ────────────────────────────────
  * The startup/onboarding entry renders the market inside a full-screen modal

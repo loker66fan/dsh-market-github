@@ -24,8 +24,8 @@
 // DSH_HOME profile, boots that profile on a free OS-assigned port (--port 0),
 // and waits for the `dsh web:` readiness line. Only the boot verdict decides
 // installability; the real profile is never touched by a failed probe.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir, networkInterfaces, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { execFile, spawn } from 'node:child_process'
@@ -110,6 +110,10 @@ function probeProxyPort(port: number): Promise<boolean> {
       headers: { Host: 'www.gstatic.com', Connection: 'close' },
       timeout: 1500,
     }, (res) => {
+      // Mid-response socket errors (ECONNRESET after headers, premature close
+      // after the timeout path destroyed the req) must not become uncaught
+      // exceptions — resolve(false) is idempotent-safe with the paths below.
+      res.on('error', () => resolve(false))
       res.resume()
       // 204 = proxy works; 5xx = proxy answered but upstream unreachable —
       // both prove the port is a proxy. Plain servers 400/404 a full-URL path.
@@ -196,27 +200,82 @@ function profileDir(profile: string): string {
   return dshHome().replace(/[\\/]+$/, '') + '/profiles/' + profile
 }
 
+/** Body cap: a request larger than 256 KiB is torn down (see readBody). */
+const MAX_BODY = 256 * 1024
+
 function readBody(req: any): Promise<Record<string, any>> {
   return new Promise((resolve) => {
     let raw = ''
-    req.on('data', (chunk: Buffer) => { raw += chunk })
+    let tooLarge = false
+    req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return
+      raw += chunk
+      if (raw.length > MAX_BODY) {
+        tooLarge = true
+        req.destroy()
+        resolve({ __tooLarge: true })
+      }
+    })
     req.on('end', () => {
+      if (tooLarge) return
       try { resolve(JSON.parse(raw || '{}')) } catch { resolve({}) }
     })
-    req.on('error', () => resolve({}))
+    req.on('error', () => { if (!tooLarge) resolve({}) })
   })
 }
 
-/** Same-origin check: the browser's Origin host must equal the request Host. */
+/** Cached allowlist of local host names: loopback literals plus every address
+ * the machine's interfaces carry (internal or not). Limitation: hostnames of
+ * those interfaces are not enumerable, so reaching this host by machine
+ * hostname from another device would be blocked — acceptable for a
+ * loopback-first harness. */
+let allowedHosts: Set<string> | null = null
+
+function localHostAllowlist(): Set<string> {
+  if (allowedHosts !== null) return allowedHosts
+  const set = new Set<string>(['127.0.0.1', 'localhost', '[::1]', '::1'])
+  try {
+    const interfaces = networkInterfaces()
+    for (const addrs of Object.values(interfaces)) {
+      for (const addr of addrs || []) {
+        set.add(addr.address)
+        // Host headers carry IPv6 literals in bracket form.
+        if (addr.address.includes(':')) set.add('[' + addr.address + ']')
+      }
+    }
+  } catch {}
+  allowedHosts = set
+  return set
+}
+
+/** Extract the hostname part of a Host header (strips :port; keeps the [ipv6]
+ * bracket form, which is how the allowlist stores IPv6 literals). */
+function hostHeaderName(host: string): string {
+  if (host.startsWith('[')) {
+    const close = host.indexOf(']')
+    return close === -1 ? host : host.slice(0, close + 1)
+  }
+  const colon = host.lastIndexOf(':')
+  return colon === -1 ? host : host.slice(0, colon)
+}
+
+/** Same-origin check: the browser's Origin host must equal the request Host,
+ * AND the Host header itself must be a local name (loopback or one of this
+ * machine's interface addresses). Under DNS rebinding the attacker's domain
+ * resolves here, so Origin===Host passes, but the Host name is foreign — the
+ * allowlist catches that. */
 function sameOrigin(req: any): boolean {
   const origin = req.headers && req.headers.origin
   const host = req.headers && req.headers.host
   if (origin === undefined || host === undefined) return false
   try {
-    return new URL(origin).host === host
+    if (new URL(origin).host !== host) return false
   } catch {
     return false
   }
+  const allow = localHostAllowlist()
+  const name = hostHeaderName(String(host)).toLowerCase()
+  return allow.has(name)
 }
 
 function sendJson(res: any, status: number, obj: unknown): void {
@@ -251,6 +310,10 @@ function restartGuardScript(port: number, execPath: string, args: string[], cwd:
     'const net=require("node:net");',
     'const PORT=' + port + ',EXEC=' + JSON.stringify(execPath) + ',ARGS=' + JSON.stringify(args) + ',CWD=' + JSON.stringify(cwd) + ';',
     // A bind probe succeeding means the old process released the port.
+    // The probe binds 127.0.0.1 specifically: on Windows a wildcard-bound
+    // (0.0.0.0) old process coexists with a specific-address bind, so the
+    // probe could report free while the port is held (EADDRINUSE possible);
+    // dsh web binds loopback by default, making this sound as shipped.
     'const tryBind=(cb)=>{const s=net.createServer();s.once("error",()=>cb(false));s.listen(PORT,"127.0.0.1",()=>{s.close(()=>cb(true))});};',
     'const started=Date.now();',
     'const poll=()=>{if(PORT<=0)return launch();tryBind((free)=>{if(free)return launch();if(Date.now()-started>15000)return launch();setTimeout(poll,100)})};',
@@ -292,6 +355,30 @@ function validProfile(p: any): boolean {
   return typeof p === 'string' && /^[A-Za-z0-9_-]+$/.test(p)
 }
 
+/** Reject specs that could smuggle shell metacharacters into the CLI forwarder
+ *  (the Windows path runs pnpm through cmd via shell:true). Deny-by-default:
+ *  the allowlist covers every spec form the plugin itself constructs —
+ *  github:user/repo, npm @scope/name, semver ranges, and the codeload
+ *  tarball URLs codeloadSpec()/npmRegistrySpec() emit (https + : / . only). */
+function safeCliSpec(spec: string): boolean {
+  const s = String(spec || '').trim()
+  // `^` is cmd.exe's escape character, so bare carets stay denied; the one
+  // sanctioned caret is the semver-range introducer right after the name@
+  // separator (pkg@^1.2.3). Collapsing that pair before the allowlist pass
+  // keeps every remaining character verified verbatim (a^b still fails).
+  const caretSafe = s.replace(/@\^/g, '@')
+  return s !== '' && s.length <= 512 && /^[\w@/:.#\-+~]+$/.test(caretSafe)
+}
+
+/** Whether an install spec is a RELATIVE path (`./x`, `../y`, `file:./z`,
+ *  `link:./w` — same regex the CLI's anchorPathSpec uses). The CLI anchors
+ *  these against its process.cwd(), so a relative spec must never be spawned
+ *  with cwd pointed at the profile dir: it would resolve INSIDE the profile
+ *  (the self-link hazard the CLI explicitly guards against). */
+function isRelativePathSpec(target: string): boolean {
+  return /^(?:file:|link:)?\.{1,2}(?:[/\\]|$)/.test(String(target || ''))
+}
+
 function opSnapshot() {
   if (!activeOp) return null
   const { id, kind, profile, target, label, startedAt, status, output, exitCode, bin, hot } = activeOp
@@ -309,7 +396,7 @@ function opSnapshot() {
 function killChild(child: any): void {
   try {
     if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
     } else {
       child.kill()
     }
@@ -329,12 +416,33 @@ function appendOutput(op: any, text: string): void {
 }
 
 /** Settle an op to a terminal status, drop its pending timeout timer, and
- * release everyone awaiting the op's `settled` promise. */
+ * release everyone awaiting the op's `settled` promise. On success the
+ * pre-write manifest snapshot is deleted (best-effort); failure/timeout/killed
+ * keep it so the user can roll back manually. */
 function settleOp(op: any, status: string, exitCode?: number): void {
   clearTimeout(op.timer)
   op.status = status
   if (exitCode !== undefined) op.exitCode = exitCode
+  if (status === 'done' && op.snapshotPath) {
+    try { unlinkSync(op.snapshotPath) } catch {}
+  }
   if (typeof op.settleResolve === 'function') op.settleResolve({ status: op.status, exitCode: op.exitCode ?? null })
+}
+
+/** Startup sweep: keep only the newest few snapshots per managed profile, so
+ * legacy accumulation (snapshots were never deleted before) cannot grow
+ * unbounded. Best-effort — ignore errors. */
+function sweepSnapshots(profile: string, keep = 3): void {
+  try {
+    const dir = profileDir(profile)
+    const snaps = readdirSync(dir)
+      .filter((f) => /^package\.json\.mkts-snapshot-(\d+)\.json$/.test(f))
+      .map((f) => ({ f, ts: Number(/mkts-snapshot-(\d+)\.json$/.exec(f)?.[1] || 0) }))
+      .sort((a, b) => b.ts - a.ts)
+    for (const { f } of snaps.slice(keep)) {
+      try { unlinkSync(join(dir, f)) } catch {}
+    }
+  } catch {}
 }
 
 interface Op {
@@ -354,6 +462,9 @@ interface Op {
   beforeDeps: Record<string, any>
   child?: any
   timer?: any
+  /** Pre-write manifest snapshot; deleted on a 'done' settle (kept on
+   * failed/timeout/killed so the user can roll back manually). */
+  snapshotPath?: string | null
   /** Resolves once the op reaches any terminal status (job `done` awaits it). */
   settled: Promise<{ status: string; exitCode: number | null }>
   settleResolve: (v: { status: string; exitCode: number | null }) => void
@@ -386,15 +497,24 @@ function startOp(kind: string, profile: string, target: string, label: string, e
     settled,
     settleResolve,
   }
-  const cwd = inv.cwd ?? profileDir(profile)
+  // A relative path spec anchors against the CLI's process.cwd(); spawning it
+  // with cwd = profile dir would resolve it INSIDE the profile (self-link
+  // hazard), so relative specs run from the host's own cwd instead.
+  const cwd = isRelativePathSpec(target) ? process.cwd() : (inv.cwd ?? profileDir(profile))
   const child = spawn(inv.file, [...inv.args, 'plugin', '--profile', profile, kind === 'uninstall' ? 'remove' : 'add', target], {
     cwd,
     env: { ...process.env, CI: 'true' },
     stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
   })
   op.child = child
-  child.stdout.on('data', (d) => { appendOutput(op, d.toString()) })
-  child.stderr.on('data', (d) => { appendOutput(op, d.toString()) })
+  // setEncoding makes Node decode utf-8 internally (buffering partial
+  // multibyte codepoints across 64KB chunk boundaries), so chunks arrive as
+  // already-decoded strings instead of split characters.
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', (s: string) => { appendOutput(op, s) })
+  child.stderr.on('data', (s: string) => { appendOutput(op, s) })
   child.on('error', (err) => {
     if (op.status !== 'running') return
     appendOutput(op, '\n[error] ' + String((err && err.message) || err))
@@ -403,40 +523,55 @@ function startOp(kind: string, profile: string, target: string, label: string, e
   child.on('close', async (code: number) => {
     if (op.status !== 'running') return
     const ok = code === 0
-    if (ok && op.kind === 'install' && hotCtx !== null) {
-      const after = readProfileDeps(op.profile)
-      const added = Object.keys(after).filter((n) => op.beforeDeps[n] === undefined)
-      // A client-only plugin (dsh.client, no dsh.bundle) cannot self-register:
-      // the browser roster scans Loader entries, so it needs a synthetic row
-      // in the profile patch. Scan ALL installed deps (a previous failed
-      // attempt may have left the dep present), idempotently.
-      let clientRows = 0
-      for (const n of Object.keys(after)) {
-        if (hasWebClient(op.profile, n) && !hasBundleManifest(op.profile, n) && ensureClientRow(op.profile, n)) {
-          clientRows += 1
+    // Post-processing (client-row writes, hot-mount IO) can throw (e.g. EBUSY
+    // on cordis.patch.yml right after pnpm churn); an unhandled rejection
+    // would crash the host AND leave the op unsettled (hang → fake timeout at
+    // 120s). Wrap everything so settleOp ALWAYS runs: a post-install failure
+    // still marks the op failed (the profile is half-managed) but the op
+    // terminates with a real verdict either way.
+    let postFailed = false
+    try {
+      if (ok && op.kind === 'install' && hotCtx !== null) {
+        const after = readProfileDeps(op.profile)
+        const added = Object.keys(after).filter((n) => op.beforeDeps[n] === undefined)
+        // A client-only plugin (dsh.client, no dsh.bundle) cannot self-register:
+        // the browser roster scans Loader entries, so it needs a synthetic row
+        // in the profile patch. Scan ALL installed deps (a previous failed
+        // attempt may have left the dep present), idempotently.
+        let clientRows = 0
+        for (const n of Object.keys(after)) {
+          if (hasWebClient(op.profile, n) && !hasBundleManifest(op.profile, n) && ensureClientRow(op.profile, n)) {
+            clientRows += 1
+          }
+        }
+        if (clientRows > 0) {
+          appendOutput(op, '\n[client] 已为 ' + String(clientRows) + ' 个纯客户端插件写入 profile 配置行，重启 web 后生效\n')
+        }
+        if (added.length > 0) {
+          const result = await tryHotMountAll(hotCtx, op.profile, op.beforeDeps)
+          if (result.hot) {
+            op.hot = true
+            appendOutput(op, '\n[hot] 已热挂载（无需重启，刷新页面即可使用）\n')
+          } else if (result.reason === 'web-client-half') {
+            appendOutput(op, '\n[hot] 该插件包含 Web 客户端，前端清单在启动时已固定，重启 web 后生效（可用横幅的「立即重启」）\n')
+          } else {
+            appendOutput(op, '\n[hot] 热挂载不可用（插件 patch 较复杂或激活验证未通过），重启 web 后生效\n')
+          }
         }
       }
-      if (clientRows > 0) {
-        appendOutput(op, '\n[client] 已为 ' + String(clientRows) + ' 个纯客户端插件写入 profile 配置行，重启 web 后生效\n')
+      if (ok && op.kind === 'uninstall') {
+        // Drop any synthetic client row the install wrote, so a leftover row
+        // cannot fail the next boot pointing at a removed package.
+        removeClientRow(op.profile, op.target)
       }
-      if (added.length > 0) {
-        const result = await tryHotMountAll(hotCtx, op.profile, op.beforeDeps)
-        if (result.hot) {
-          op.hot = true
-          appendOutput(op, '\n[hot] 已热挂载（无需重启，刷新页面即可使用）\n')
-        } else if (result.reason === 'web-client-half') {
-          appendOutput(op, '\n[hot] 该插件包含 Web 客户端，前端清单在启动时已固定，重启 web 后生效（可用横幅的「立即重启」）\n')
-        } else {
-          appendOutput(op, '\n[hot] 热挂载不可用（插件 patch 较复杂或激活验证未通过），重启 web 后生效\n')
-        }
-      }
+    } catch (e: any) {
+      postFailed = true
+      appendOutput(op, '\n[error] ' + String((e && e.message) || e))
+      appendOutput(op, '\n[error] 安装后处理失败（profile 配置行未写入），profile 可能处于半管理状态\n')
     }
-    if (ok && op.kind === 'uninstall') {
-      // Drop any synthetic client row the install wrote, so a leftover row
-      // cannot fail the next boot pointing at a removed package.
-      removeClientRow(op.profile, op.target)
+    if (op.status === 'running') {
+      settleOp(op, ok && !postFailed ? 'done' : 'failed', code)
     }
-    settleOp(op, ok ? 'done' : 'failed', code)
   })
   op.timer = setTimeout(() => {
     if (op.status !== 'running') return
@@ -451,11 +586,13 @@ function startOp(kind: string, profile: string, target: string, label: string, e
 /** Host ctx for hot-mounting, set by apply(); null in headless/test contexts. */
 let hotCtx: any = null
 
-/** Abort the live op (used by the panel and the global progress pill). */
-function killOp(): { ok: boolean; error?: string } {
+/** Abort the live op (used by the panel and the global progress pill). The
+ *  optional reason distinguishes a user kill from teardown kills (plugin
+ *  dispose/reload) in the output the user reads back. */
+function killOp(reason?: string): { ok: boolean; error?: string } {
   const op = activeOp
   if (!op || op.status !== 'running') return { ok: false, error: '没有正在运行的任务' }
-  appendOutput(op, '\n\n[killed] 已由用户终止')
+  appendOutput(op, '\n\n[killed] ' + (reason !== undefined && reason !== '' ? reason : '已由用户终止'))
   settleOp(op, 'killed')
   killChild(op.child)
   return { ok: true }
@@ -621,7 +758,7 @@ async function runProbe(explicitBin: string, source: string, allowBuilds?: reado
 
 function spawnCapture(exe: string, args: string[], { cwd, env, timeoutMs, readyRe }: any): Promise<any> {
   return new Promise((resolve) => {
-    const child = spawn(exe, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(exe, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
     let output = ''
     let settled = false
     let timer: any
@@ -633,6 +770,8 @@ function spawnCapture(exe: string, args: string[], { cwd, env, timeoutMs, readyR
         killChild(child)
       }
     }
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
     child.stdout.on('data', onData)
     child.stderr.on('data', onData)
     child.on('error', (err) => finish({ ok: false, ready: false, output: output + '\n[error] ' + String((err && err.message) || err) }))
@@ -791,10 +930,17 @@ async function searchGitHub(
     })
     if (res.status === 403 || res.status === 429) {
       const remaining = res.headers.get('x-ratelimit-remaining')
+      // x-ratelimit-reset is a unix epoch (seconds); surface the wait so the
+      // caller knows how long "稍后" is. Never cached (this returns before the
+      // searchCache.set on the success path only).
+      const reset = Number(res.headers.get('x-ratelimit-reset'))
+      const waitSec = Number.isFinite(reset) && reset > 0 ? Math.max(0, Math.round(reset - Date.now() / 1000)) : null
       return {
         plugins: [], total: 0,
         rate: { limit: res.headers.get('x-ratelimit-limit'), remaining },
-        error: 'GitHub 搜索限速（剩余 ' + (remaining ?? '0') + ' 次/分钟）。配置 GITHUB_TOKEN 可提高配额，或稍后重试。',
+        error: 'GitHub 搜索限速（剩余 ' + (remaining ?? '0') + ' 次/分钟'
+          + (waitSec !== null ? '，' + Math.ceil(waitSec / 60) + ' 分钟后重置' : '')
+          + '）。配置 GITHUB_TOKEN 可提高配额，或稍后重试。',
       }
     }
     if (!res.ok) throw new Error('HTTP ' + res.status)
@@ -841,9 +987,22 @@ function parseSimplePatch(patchText: string): { id: string; name: string }[] | n
 }
 
 let hotTreeClass: any = undefined
+/** Bounded negative retry: a transient import failure (plugin compiled with a
+ *  different ts config, temp FS hiccup) must not disable hot-mount for the
+ *  whole process, but the import also must not be retried forever. */
+let hotTreeAttempts = 0
+/** Exhausted-retry flag so the give-up is logged exactly once. */
+let hotTreeGaveUp = false
 
 async function loadHotTreeClass(): Promise<any> {
   if (hotTreeClass !== undefined) return hotTreeClass
+  if (hotTreeAttempts >= 3) {
+    if (!hotTreeGaveUp) {
+      hotTreeGaveUp = true
+      console.warn('[dsh-market] hot-mount tree class unavailable after 3 attempts; hot-mount disabled for this process (restart to retry)')
+    }
+    return null
+  }
   try {
     const mod = await import('@deepseek-ai/cordis-plugin-include')
     const Include = mod.Include
@@ -852,8 +1011,11 @@ async function loadHotTreeClass(): Promise<any> {
       write() {}
     }
     hotTreeClass = MarketHotTree
+    hotTreeAttempts = 0
   } catch {
-    hotTreeClass = null
+    // Not cached as a permanent null: the next call retries (up to 3 total).
+    hotTreeAttempts += 1
+    return null
   }
   return hotTreeClass
 }
@@ -863,7 +1025,17 @@ function cleanHotDir(profile: string): void {
 }
 
 let hotSequence = 0
-const hotHandles = new Map<string, any>()
+/** Live hot-mounts: key `profile + ' ' + name` → { handle, file }. The yml file
+ *  IS the active patch while mounted, so it is kept on success and deleted only
+ *  when the mount dies (failure or dispose). */
+const hotHandles = new Map<string, { handle: any; file: string }>()
+
+/** Best-effort delete of a hot-mount temp yml (debris cleanup) — never throws,
+ *  so it is safe from close handlers and dispose paths. */
+function removeHotYml(file: string | null): void {
+  if (file === null) return
+  try { rmSync(file, { force: true, maxRetries: 3 }) } catch {}
+}
 
 /** Whether an installed package declares a browser client half (`dsh.client`). */
 function hasWebClient(profile: string, packageName: string): boolean {
@@ -997,6 +1169,7 @@ function mapLivePhase(state: number | undefined | null): 'active' | 'loading' | 
  */
 async function hotMount(ctx: any, profile: string, packageName: string): Promise<boolean> {
   let handle: any = null
+  let ymlFile: string | null = null
   try {
     const HotTree = await loadHotTreeClass()
     if (HotTree === null) return false
@@ -1009,6 +1182,7 @@ async function hotMount(ctx: any, profile: string, packageName: string): Promise
     const file = join(dir, 'hot-' + String(hotSequence) + '.yml')
     const yml = rows.map((row) => `- id: mkt-${row.id}\n  name: '${row.name}'\n`).join('')
     writeFileSync(file, yml)
+    ymlFile = file
     handle = ctx.plugin(HotTree, { path: pathToFileURL(file).href })
     await handle.await()
     // Verify the mounted rows actually activated: a row whose inject
@@ -1023,30 +1197,37 @@ async function hotMount(ctx: any, profile: string, packageName: string): Promise
       const entries = loader ? [...loader.entries()].filter((e: any) => e.options && names.has(e.options.name)) : []
       const states = entries.map((e: any) => (e.fiber ? e.fiber.state : undefined))
       if (states.length > 0 && states.every((s: any) => s === FIBER_ACTIVE)) {
-        hotHandles.set(packageName, handle)
+        // Keyed by profile + name: two profiles installing the same package
+        // are distinct mounts, and a dispose must hit the right handle.
+        // The yml stays: it IS the active patch for the live mount.
+        hotHandles.set(profile + ' ' + packageName, { handle, file })
         return true
       }
       if (states.includes(FIBER_FAILED)) break
       await new Promise((r) => setTimeout(r, 250))
     }
     try { await handle.dispose() } catch {}
+    removeHotYml(ymlFile)
     return false
   } catch (e: any) {
     if (handle !== null) { try { await handle.dispose() } catch {} }
+    removeHotYml(ymlFile)
     console.warn('[dsh-market] hot mount of ' + packageName + ' failed, restart required: ' + String((e && e.message) || e))
     return false
   }
 }
 
-async function disposeHotMount(packageName: string): Promise<void> {
-  const handle = hotHandles.get(packageName)
-  if (!handle) return
-  hotHandles.delete(packageName)
+async function disposeHotMount(profile: string, packageName: string): Promise<void> {
+  const entry = hotHandles.get(profile + ' ' + packageName)
+  if (!entry) return
+  hotHandles.delete(profile + ' ' + packageName)
   try {
-    await handle.dispose()
+    await entry.handle.dispose()
   } catch (e: any) {
     console.warn('[dsh-market] dispose of hot mount ' + packageName + ' failed: ' + String((e && e.message) || e))
   }
+  // The mount is gone, so its patch yml is debris now — best-effort delete.
+  removeHotYml(entry.file)
 }
 
 /**
@@ -1225,7 +1406,7 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
       }
     } else {
       removeClientRow(profile, name)
-      await withTimeout(disposeHotMount(name), 4000)
+      await withTimeout(disposeHotMount(profile, name), 4000)
       await withTimeout(disableLoaderEntry(loaderNamesFor(profile, name)), 4000)
     }
     return { ok: true, active: enabled, needsRestart: true, message: enabled ? 'enabled:restart' : 'disabled:restart' }
@@ -1244,7 +1425,7 @@ async function toggleActive(profile: string, name: string, enabled: boolean): Pr
 
   if (!enabled) {
     // Stop serving immediately: dispose hot mount + disable loader entry.
-    await withTimeout(disposeHotMount(name), 4000)
+    await withTimeout(disposeHotMount(profile, name), 4000)
     await withTimeout(disableLoaderEntry(loaderNamesFor(profile, name)), 4000)
   }
 
@@ -1541,12 +1722,15 @@ function compileParameterSpec(spec: Record<string, any>): Record<string, any> {
   return schema
 }
 
-/** Run one dsh CLI invocation synchronously and return the captured result. */
-function runCliSync(args: string[], timeoutMs: number): Promise<any> {
+/** Run one dsh CLI invocation synchronously and return the captured result.
+ *  `target` (the install spec, when the args carry one) anchors the cwd the
+ *  same way startOp does: a relative path spec must resolve against the
+ *  host's cwd, never the profile dir (self-link hazard). */
+function runCliSync(args: string[], timeoutMs: number, target?: string): Promise<any> {
   const inv = dshInvoke()
   if (!inv) return Promise.reject(new Error('dsh CLI 未定位（可在面板填写路径）'))
   return spawnCapture(inv.file, [...inv.args, ...args], {
-    cwd: inv.cwd ?? profileDir(TOOL_PROFILE),
+    cwd: target !== undefined && isRelativePathSpec(target) ? process.cwd() : (inv.cwd ?? profileDir(TOOL_PROFILE)),
     env: { ...process.env, CI: 'true' },
     timeoutMs,
   })
@@ -1663,8 +1847,11 @@ function registerMarketTools(ctx: any): void {
     },
     async execute(args: any) {
       const q = String((args && args.q) || '').trim()
-      const page = Math.max(1, Number((args && args.page) || 1))
-      const perPage = Math.min(100, Math.max(1, Number((args && args.perPage) || 50)))
+      // Floor to integers: the output schema declares page/perPage/total as
+      // integer, and a model-supplied 1.5 would pass Math.max straight through
+      // and fail the registry's output validation.
+      const page = Math.max(1, Math.floor(Number((args && args.page) || 1)) || 1)
+      const perPage = Math.min(100, Math.max(1, Math.floor(Number((args && args.perPage) || 50)) || 50))
       const r = await searchGitHub(q, { sort: 'stars', order: 'desc', page, perPage })
       if (r.error) throw new Error(r.error)
       return {
@@ -1680,7 +1867,9 @@ function registerMarketTools(ctx: any): void {
         total: r.total,
         page,
         perPage,
-        hasMore: page * perPage < r.total,
+        // GitHub search caps at the first 1000 results (page 21 at perPage 50
+        // 422s), so never tell the model more pages exist past the cap.
+        hasMore: page * perPage < Math.min(r.total, 1000),
       }
     },
   })
@@ -1723,6 +1912,7 @@ function registerMarketTools(ctx: any): void {
     async execute(args: any, exec: any) {
       const spec = String((args && args.spec) || '').trim()
       if (!spec) throw new Error('market_install requires a non-empty spec')
+      if (!safeCliSpec(spec)) throw new Error('安装目标包含不支持的字符')
       const bin = String(dshBin() || '')
       if (!bin) throw new Error('dsh CLI 未定位（可在面板填写路径）')
       // Single-flight invariant: the tool path and the UI share one CLI pnpm
@@ -1732,6 +1922,10 @@ function registerMarketTools(ctx: any): void {
         throw new Error('已有任务进行中：' + activeOp.label + '（等待完成后再试）')
       }
       const before = readProfileDeps(TOOL_PROFILE)
+      // Proxy env must be settled BEFORE resolveInstallSpec spawns its probe
+      // pnpm, or a cold start runs the probe without proxy env → spurious
+      // refusal. Caps at 2s, so this cannot hang the tool call.
+      await waitProxyReady(2000)
       const resolved = await resolveInstallSpec(spec, bin, TOOL_PROFILE)
       if (!resolved.ok) throw new Error(resolved.output)
       const jobs = ctx.get('jobs')
@@ -1741,7 +1935,6 @@ function registerMarketTools(ctx: any): void {
         if (activeOp && activeOp.status === 'running') {
           throw new Error('已有任务进行中：' + activeOp.label + '（等待完成后再试）')
         }
-        await waitProxyReady(2000)
         const started = startMarketJob(jobs, exec, 'market-install', spec, () => {
           const r = startOp('install', TOOL_PROFILE, resolved.installSpec, spec, bin,
             'market_install: ' + spec + ' → ' + resolved.installSpec + '\n')
@@ -1756,7 +1949,7 @@ function registerMarketTools(ctx: any): void {
         throw new Error(started.error)
       }
       // Synchronous fallback (jobs service unavailable, e.g. headless profile).
-      const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', resolved.installSpec], PROBE_INSTALL_TIMEOUT)
+      const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', resolved.installSpec], PROBE_INSTALL_TIMEOUT, resolved.installSpec)
       if (!result.ok) {
         throw new Error('安装失败（exit ' + String(result.code ?? '?') + '）：\n' + String(result.output || '').slice(-4000))
       }
@@ -1779,8 +1972,8 @@ function registerMarketTools(ctx: any): void {
       schema: {
         type: 'object',
         properties: {
-          plugins: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string' }, enabled: { type: 'boolean' }, live: { oneOf: [{ type: 'string', enum: ['active', 'loading', 'pending', 'failed', 'unloading'] }, { type: 'null' }] }, version: { type: 'string' }, latestVersion: { type: 'string' }, updateAvailable: { type: 'boolean' } }, additionalProperties: true } },
-          self: { oneOf: [{ type: 'object', properties: { name: { type: 'string' }, version: { type: 'string' }, latestVersion: { type: 'string' } }, additionalProperties: true }, { type: 'null' }] },
+          plugins: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, kind: { type: 'string' }, enabled: { type: 'boolean' }, live: { oneOf: [{ type: 'string', enum: ['active', 'loading', 'pending', 'failed', 'unloading'] }, { type: 'null' }] }, version: { oneOf: [{ type: 'string' }, { type: 'null' }] }, latestVersion: { oneOf: [{ type: 'string' }, { type: 'null' }] }, updateAvailable: { type: 'boolean' } }, additionalProperties: true } },
+          self: { oneOf: [{ type: 'object', properties: { name: { type: 'string' }, version: { oneOf: [{ type: 'string' }, { type: 'null' }] }, latestVersion: { oneOf: [{ type: 'string' }, { type: 'null' }] }, additionalProperties: true } }, { type: 'null' }] },
           restartHint: { type: 'string' },
         },
         additionalProperties: true,
@@ -1862,6 +2055,7 @@ function registerMarketTools(ctx: any): void {
       const target = String(spec).startsWith('github:') ? String(spec).replace(/#.*$/, '')
         : String(spec).startsWith('https://codeload.github.com/') ? String(spec).replace(/\/tar\.gz\/.+$/, '/tar.gz/HEAD')
         : `${name}@latest`
+      if (!safeCliSpec(target)) throw new Error('安装目标包含不支持的字符')
       updatesCache = { ...updatesCache, [TOOL_PROFILE]: null }
       // Single-flight invariant shared with the UI route (one CLI pnpm serial).
       if (activeOp && activeOp.status === 'running') {
@@ -1882,7 +2076,7 @@ function registerMarketTools(ctx: any): void {
         if ('jobId' in started) return { kind: 'background' as const, jobId: started.jobId }
         throw new Error(started.error)
       }
-      const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', target], PROBE_INSTALL_TIMEOUT)
+      const result = await runCliSync(['plugin', '--profile', TOOL_PROFILE, 'add', target], PROBE_INSTALL_TIMEOUT, target)
       if (!result.ok) {
         throw new Error('更新失败（exit ' + String(result.code ?? '?') + '）：\n' + String(result.output || '').slice(-4000))
       }
@@ -1895,7 +2089,7 @@ function registerMarketTools(ctx: any): void {
 /** Read-only view of the updates cache for tests (the live object identity). */
 function updatesCacheView(): Record<string, any> { return updatesCache }
 
-export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, mapLivePhase, liveLoaderStates, marketJobHooks, startOp, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView, compileParameterSpec } // test hooks
+export { classifyPlugin, runProbe, parseSimplePatch, checkUpdates, toggleActive, searchGitHub, mapGitHubItem, buildSearchQuery, npmRegistrySpec, normalizeRepoUrl, ensureAllowBuilds, hasWebClient, ensureClientRow, removeClientRow, clientRowPresent, readClientRows, codeloadSpec, allowBuildKeys, resolveInstallSpec, listInstalled, checkSelfUpdate, detectProxy, probeProxyPort, loaderNamesFor, mapLivePhase, liveLoaderStates, marketJobHooks, startOp, restartGuardScript, searchCache, pruneSearchCache, updatesCacheView, compileParameterSpec, safeCliSpec, sweepSnapshots, isRelativePathSpec } // test hooks
 
 export function apply(ctx: any): void {
   const webServer = ctx.get('webServer')
@@ -1905,6 +2099,8 @@ export function apply(ctx: any): void {
   }
   hotCtx = ctx
   cleanHotDir('web')
+  // Legacy snapshot accumulation sweep (see snapshotProfile/sweepSnapshots).
+  sweepSnapshots('web')
   // Detect the device proxy once and apply it to process.env so install
   // children (pnpm/git) inherit it — no hardcoded proxy port.
   void ensureProxyDetected()
@@ -1918,10 +2114,13 @@ export function apply(ctx: any): void {
     handler: async (req: any, res: any) => {
       try {
         const body = await readBody(req)
+        if (body.__tooLarge) return sendJson(res, 413, { ok: false, error: 'payload too large' })
         const method = String(body.method || '')
         if (method === 'search') {
           // Real-time GitHub search over `topic:dsh-plugin` (server-side proxy
-          // to avoid CORS and share the rate limit). Read-only, so no origin gate.
+          // to avoid CORS and share the rate limit). The origin gate blocks
+          // DNS-rebinding pages from probing through this host's network.
+          if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, error: 'untrusted origin' })
           const r = await searchGitHub(String(body.q || ''), {
             sort: String(body.sort || 'stars'),
             order: String(body.order || 'desc'),
@@ -1932,6 +2131,7 @@ export function apply(ctx: any): void {
           return sendJson(res, 200, { ok: true, plugins: r.plugins, total: r.total, rate: r.rate ?? null, source: 'github' })
         }
         if (method === 'probe') {
+          if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, error: 'untrusted origin' })
           const explicit = String(body.binPath || '').trim()
           let binValid: boolean | null = null
           if (explicit) {
@@ -1949,6 +2149,7 @@ export function apply(ctx: any): void {
           })
         }
         if (method === 'installed') {
+          if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, error: 'untrusted origin' })
           const profile = validProfile(body.profile) ? body.profile : 'web'
           const p = profileDir(profile) + '/package.json'
           if (!existsSync(p)) return sendJson(res, 200, { ok: true, profile, bundles: [], dependencies: {}, plugins: [], self: null })
@@ -1966,6 +2167,7 @@ export function apply(ctx: any): void {
           })
         }
         if (method === 'updates') {
+          if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, error: 'untrusted origin' })
           const profile = validProfile(body.profile) ? body.profile : 'web'
           const updates = await checkUpdates(profile)
           return sendJson(res, 200, { ok: true, profile, updates })
@@ -1987,6 +2189,7 @@ export function apply(ctx: any): void {
           const target = spec.startsWith('github:') ? spec.replace(/#.*$/, '')
             : spec.startsWith('https://codeload.github.com/') ? spec.replace(/\/tar\.gz\/.+$/, '/tar.gz/HEAD')
             : `${name}@latest`
+          if (!safeCliSpec(target)) return sendJson(res, 200, { ok: false, output: '安装目标包含不支持的字符' })
           const label = String(body.label || name)
           updatesCache = { ...updatesCache, [profile]: null }
           await waitProxyReady(2000)
@@ -1996,6 +2199,7 @@ export function apply(ctx: any): void {
           return sendJson(res, 200, { ok: true, opId: started.opId, timeoutMs: DEFAULT_TIMEOUT })
         }
         if (method === 'op') {
+          if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, error: 'untrusted origin' })
           const wanted = String(body.opId || '')
           const op = opSnapshot()
           if (op === null) return sendJson(res, 200, { ok: true, op: null })
@@ -2004,6 +2208,14 @@ export function apply(ctx: any): void {
         }
         if (method === 'kill') {
           if (!sameOrigin(req)) return sendJson(res, 403, { ok: false, error: 'untrusted origin' })
+          // Scope the kill to the op the CLIENT means: a stale-generation kill
+          // (sent for old op A after the server already moved to op B) must
+          // not murder B. No opId = kill-any (the starting-phase kill relies
+          // on killing whatever runs). Same scoping as marketJobHooks.cancel.
+          const wantedOp = String(body.opId || '')
+          if (wantedOp && activeOp && activeOp.id !== wantedOp) {
+            return sendJson(res, 200, { ok: false, error: '任务已切换' })
+          }
           return sendJson(res, 200, killOp())
         }
         if (method === 'restart') {
@@ -2019,6 +2231,12 @@ export function apply(ctx: any): void {
           const profile = validProfile(body.profile) ? body.profile : 'web'
           const name = String(body.name || '').trim()
           if (!name) return sendJson(res, 400, { ok: false, output: '缺少插件名' })
+          // Same busy check as install/uninstall: toggleActive mutates the
+          // profile (bundles list / patch rows) while a pnpm child may be
+          // rewriting the very same files.
+          if (activeOp && activeOp.status === 'running') {
+            return sendJson(res, 200, { ok: false, busy: true, output: '已有任务进行中：' + activeOp.label })
+          }
           const enabled = body.enabled === true
           const result = await toggleActive(profile, name, enabled)
           return sendJson(res, result.ok ? 200 : 200, result)
@@ -2028,28 +2246,42 @@ export function apply(ctx: any): void {
           const profile = validProfile(body.profile) ? body.profile : 'web'
           const target = String(method === 'install' ? (body.source || '') : (body.pkg || '')).trim()
           if (!target) return sendJson(res, 400, { ok: false, output: '缺少参数' })
+          if (!safeCliSpec(target)) return sendJson(res, 200, { ok: false, output: '安装目标包含不支持的字符' })
+          // Busy check BEFORE any side effect: the uninstall branch below
+          // disposes the hot mount / disables loader entries, and those must
+          // not run when startOp would refuse anyway. startOp re-checks at
+          // its own chokepoint, covering the async resolveInstallSpec window.
           if (activeOp && activeOp.status === 'running') {
             return sendJson(res, 200, { ok: false, busy: true, output: '已有任务进行中：' + activeOp.label })
           }
           if (method === 'install' && profile === 'web' && !body.skipCheck) {
             const bin = String(body.binPath || '').trim() || dshBin()
             if (!bin) return sendJson(res, 200, { ok: false, error: 'dsh CLI 未定位（可在面板填写路径）' })
+            // Proxy env must be settled BEFORE resolveInstallSpec spawns its
+            // probe pnpm (up to 240s), or a cold start probes without proxy
+            // env → spurious refusal. Caps at 2s.
+            await waitProxyReady(2000)
             const resolved = await resolveInstallSpec(target, bin, profile)
             if (!resolved.ok) {
               return sendJson(res, 200, { ok: false, refused: true, output: resolved.output })
             }
             const installSpec = resolved.installSpec
+            if (!safeCliSpec(installSpec)) return sendJson(res, 200, { ok: false, output: '安装目标包含不支持的字符' })
             const snap = snapshotProfile(profile)
             const label = String(body.label || target)
-            await waitProxyReady(2000)
             const started = startOp(method, profile, installSpec, label, bin,
               snap ? '已备份安装前状态：' + snap + '\n' : '')
+            // Thread the snapshot path so settleOp('done') can delete it
+            // (kept on failure for manual rollback).
+            if (started.ok && started.opId && activeOp && activeOp.id === started.opId && snap) {
+              activeOp.snapshotPath = snap
+            }
             if (!started.ok) return sendJson(res, 200, started)
             return sendJson(res, 200, { ok: true, opId: started.opId, timeoutMs: DEFAULT_TIMEOUT, spec: installSpec })
           }
           const label = String(body.label || target)
           if (method === 'uninstall') {
-            await withTimeout(disposeHotMount(target), 4000)
+            await withTimeout(disposeHotMount(profile, target), 4000)
             await withTimeout(disableLoaderEntry(loaderNamesFor(profile, target)), 4000)
           }
           await waitProxyReady(2000)
@@ -2063,4 +2295,21 @@ export function apply(ctx: any): void {
       }
     },
   })
+  // Teardown: kill a running install child (no orphan pnpm mutating the
+  // profile after this plugin unloads) and drop a pending restart timer.
+  // settleOp (via killOp) already clears op.timer, so no extra gap remains.
+  // Cordis idiom is ctx.effect(() => disposer); fall back to a 'dispose'
+  // event for contexts that expose one instead.
+  const cleanup = () => {
+    killOp('插件停用/重载，终止进行中的任务')
+    if (restartTimer !== null) {
+      clearTimeout(restartTimer)
+      restartTimer = null
+    }
+  }
+  if (typeof (ctx as any).effect === 'function') {
+    ;(ctx as any).effect(() => cleanup)
+  } else if (typeof (ctx as any).on === 'function') {
+    ;(ctx as any).on('dispose', cleanup)
+  }
 }

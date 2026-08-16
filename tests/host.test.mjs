@@ -1,8 +1,8 @@
 // Local harness for lib/host.js: mounts the plugin against a fake webServer and
 // exercises the API surface + op pipeline with a fake CLI bin (no real profile
 // or network install is touched). Run: node --test tests/host.test.mjs
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir, networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
@@ -144,6 +144,59 @@ check('install rejected cross-origin', crossOrigin.ok === false && /untrusted/.t
 const crossKill = await call({ method: 'kill' }, { origin: 'http://evil.example' })
 check('kill rejected cross-origin', crossKill.ok === false && /untrusted/.test(crossKill.error || ''), crossKill)
 
+// --- same-origin Host-header pinning (DNS-rebinding defense, read methods ---
+// Origin===Host alone must NOT pass: the Host name itself must be local
+// (loopback literal or one of this machine's interface addresses), else a
+// rebinding domain that resolves to this host is still refused.
+const rebind = await call({ method: 'search', q: '', perPage: 4 }, { origin: 'http://rebind.evil.com:3080', host: 'rebind.evil.com:3080' })
+check('search rejected when Host is a foreign (rebinding) name', rebind.ok === false && /untrusted/.test(String(rebind.error || '')), rebind)
+// The literal rebinding pair (origin without port vs Host with port) is an
+// origin/Host mismatch — also refused, never silently trusted.
+const rebindMismatch = await call({ method: 'search', q: '', perPage: 4 }, { origin: 'http://rebind.evil.com', host: 'rebind.evil.com:3080' })
+check('search rejected on rebinding origin/Host port mismatch', rebindMismatch.ok === false && /untrusted/.test(String(rebindMismatch.error || '')), rebindMismatch)
+// Genuine local names pass the gate (the search itself may still fail offline
+// or rate-limited — the point is the failure is never an 'untrusted' refusal).
+const loOrigin = await call({ method: 'search', q: '', perPage: 4 }, { origin: 'http://127.0.0.1:3080', host: '127.0.0.1:3080' })
+check('search not untrusted for 127.0.0.1 Host', !/untrusted/.test(String(loOrigin.error || '')), loOrigin)
+const lhOrigin = await call({ method: 'search', q: '', perPage: 4 }, { origin: 'http://localhost:3080', host: 'localhost:3080' })
+check('search not untrusted for localhost Host', !/untrusted/.test(String(lhOrigin.error || '')), lhOrigin)
+// Cross-origin mismatch against a local Host is still refused.
+const crossSearch = await call({ method: 'search', q: '', perPage: 4 }, { origin: 'http://evil.example', host: '127.0.0.1:3080' })
+check('search rejected on origin/Host mismatch', crossSearch.ok === false && /untrusted/.test(String(crossSearch.error || '')), crossSearch)
+// A LAN interface address of THIS machine is in the allowlist, so the host's
+// own browser reaching it via that address must not be rebinding-blocked.
+const ifAddr = Object.values(networkInterfaces()).flat()
+  .filter((a) => a && !a.internal && a.family === 'IPv4').map((a) => a.address)[0]
+if (ifAddr) {
+  const lanOrigin = await call({ method: 'search', q: '', perPage: 4 }, { origin: 'http://' + ifAddr + ':3080', host: ifAddr + ':3080' })
+  check('search not untrusted for a local interface Host', !/untrusted/.test(String(lanOrigin.error || '')), [ifAddr, lanOrigin.error])
+} else {
+  skip('search via local interface address (no external IPv4 interface)')
+}
+
+// --- readBody 256KiB cap: oversized request torn down with 413 ---
+{
+  const big = Buffer.from('x'.repeat(257 * 1024)) // 1KiB over MAX_BODY
+  let status = null
+  const req = {
+    headers: { origin: 'http://127.0.0.1:3080', host: '127.0.0.1:3080' },
+    destroyed: false,
+    destroy() { req.destroyed = true },
+    on(ev, cb) {
+      if (ev === 'data') cb(big)
+      if (ev === 'end') setTimeout(cb, 0)
+    },
+  }
+  const res = {
+    writeHead(code) { status = code },
+    end(payload) { res.body = JSON.parse(payload) },
+  }
+  await handler(req, res)
+  check('readBody rejects >256KiB body with 413', status === 413 && res.body && res.body.ok === false
+    && /too large|payload/i.test(String(res.body.error || '')), { status, body: res.body })
+  check('oversized request socket is torn down', req.destroyed === true, req.destroyed)
+}
+
 // --- install safety gate (GitHub sources verified via their dsh manifest) ---
 // A github: source whose package.json cannot be read (nonexistent repo or
 // offline) is refused before any profile write.
@@ -179,9 +232,85 @@ check('codeloadSpec maps github: to tarball URL', mod.codeloadSpec('github:acme/
 check('codeloadSpec strips .git suffix', mod.codeloadSpec('github:acme/plugin.git') === 'https://codeload.github.com/acme/plugin/tar.gz/HEAD', mod.codeloadSpec('github:acme/plugin.git'))
 check('codeloadSpec null for non-github spec', mod.codeloadSpec('@scope/pkg') === null, mod.codeloadSpec('@scope/pkg'))
 
+// --- isRelativePathSpec: relative path specs anchor against the CLI's cwd ---
+// startOp must NOT point such specs at the profile dir (self-link hazard), so
+// the detection here mirrors the CLI's anchorPathSpec regex exactly.
+if (mod.isRelativePathSpec) {
+  const rel = ['./x', '../y', 'file:./z', 'link:./w', '.', '..', './', 'file:.', 'link:../foo', '.\\x', '..\\y']
+  const abs = ['/abs/pkg', 'C:/abs/pkg', 'C:\\abs\\pkg', '@some/pkg', 'some-pkg', 'github:owner/repo', 'https://codeload.github.com/o/r/tar.gz/HEAD', 'file:/abs/pkg']
+  check('isRelativePathSpec true for relative specs', rel.every((s) => mod.isRelativePathSpec(s) === true),
+    rel.filter((s) => mod.isRelativePathSpec(s) !== true))
+  check('isRelativePathSpec false for absolute/registry/remote specs', abs.every((s) => mod.isRelativePathSpec(s) === false),
+    abs.filter((s) => mod.isRelativePathSpec(s) !== false))
+} else {
+  check('isRelativePathSpec test hook exposed', false, 'no isRelativePathSpec export')
+}
+
+// --- safeCliSpec: spec allowlist for the CLI forwarder (deny-by-default) ---
+// The Windows path runs pnpm through cmd (shell:true), so a spec must never be
+// able to smuggle shell metacharacters; the allowlist covers every spec form
+// the plugin itself constructs (github:, npm scope/name, semver ranges,
+// codeload tarball URLs, file: paths).
+if (typeof mod.safeCliSpec === 'function') {
+  const good = [
+    'loker66fan/dsh-market-github',                       // bare owner/repo
+    'github:loker66fan/dsh-market-github#v0.3.0',         // pinned github ref
+    '@scope/pkg@2.1.0',                                   // scoped npm exact
+    'https://codeload.github.com/o/r/tar.gz/HEAD',        // CDN tarball URL
+    'file:C:/abs/path',                                   // absolute file spec
+    'pkg@^1.2.3',                                         // semver range caret
+    'dsh-market-github',                                  // bare package name
+  ]
+  check('safeCliSpec accepts every constructed spec form', good.every((s) => mod.safeCliSpec(s) === true),
+    good.filter((s) => mod.safeCliSpec(s) !== true))
+  const bad = [
+    '`whoami`', 'a&b', 'a|b', 'a<b', 'a>b',                // shell metacharacters
+    'a^b', 'a%b', 'a"b', "a'b",                           // cmd.exe hazards
+    'a\nb', 'a\tb',                                       // whitespace injection
+    '', '   ',                                            // empty / whitespace-only
+    'x'.repeat(600),                                      // over the 512 cap
+  ]
+  check('safeCliSpec rejects metacharacters, whitespace and oversize', bad.every((s) => mod.safeCliSpec(s) === false),
+    bad.map((s) => JSON.stringify(s).slice(0, 24)).filter((_, i) => mod.safeCliSpec(bad[i]) !== false))
+} else {
+  check('safeCliSpec test hook exposed', false, 'no safeCliSpec export')
+}
+
 // --- device proxy auto-detection ---
 const closedPort = await mod.probeProxyPort(1)
 check('probeProxyPort false for closed port', closedPort === false, closedPort)
+// Truncated response: headers arrive, then the socket dies mid-body — the res
+// 'error' path must resolve(false), never surface an uncaught ECONNRESET (the
+// pre-fix crash took the whole host down during proxy detection).
+{
+  const trunc = await new Promise((resolve) => {
+    const s = createServer((sock) => {
+      sock.write('HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n')
+      sock.destroy()
+    })
+    s.listen(0, '127.0.0.1', () => resolve(s))
+  })
+  const truncPort = trunc.address().port
+  const truncated = await mod.probeProxyPort(truncPort)
+  check('probeProxyPort resolves false on truncated response', truncated === false, truncated)
+  await new Promise((r) => trunc.close(() => r()))
+}
+// Clean 204: a full well-formed response is the proxy-works signal → true.
+{
+  const okSrv = await new Promise((resolve) => {
+    const s = createServer((sock) => {
+      sock.on('data', () => {
+        sock.write('HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        sock.end()
+      })
+    })
+    s.listen(0, '127.0.0.1', () => resolve(s))
+  })
+  const okPort = okSrv.address().port
+  const okProbe = await mod.probeProxyPort(okPort)
+  check('probeProxyPort true on clean 204', okProbe === true, okProbe)
+  await new Promise((r) => okSrv.close(() => r()))
+}
 const detected = await mod.detectProxy()
 check('detectProxy returns url or null', detected === null || (typeof detected === 'string' && /^https?:\/\//.test(detected)), detected)
 
@@ -333,6 +462,25 @@ await new Promise((r) => setTimeout(r, 600))
 const opAfterKill = await call({ method: 'op', opId: op2.opId })
 check('op status killed', opAfterKill.ok && opAfterKill.op && opAfterKill.op.status === 'killed', opAfterKill)
 
+// kill opId scoping: a stale-generation kill (sent for an old op id after the
+// server already moved on) must NOT murder the op currently running — it
+// answers ok:false 任务已切换; the same kill with the RIGHT id succeeds.
+writeFileSync(fakeBin, `setTimeout(() => {}, 60000)\n`)
+const scopedOp = await call({ method: 'install', source: 'fake:scoped', profile: 'web', binPath: fakeBin, label: 'scoped', skipCheck: true })
+check('scoped-kill op starts', scopedOp.ok && scopedOp.opId, scopedOp)
+await new Promise((r) => setTimeout(r, 300))
+const wrongKill = await call({ method: 'kill', opId: 'op-999999' })
+check('kill with wrong opId refused', wrongKill.ok === false && /任务已切换/.test(String(wrongKill.error || '')), wrongKill)
+const stillRunning = await call({ method: 'op', opId: scopedOp.opId })
+check('wrong-opId kill leaves the op running', stillRunning.ok && stillRunning.op
+  && stillRunning.op.id === scopedOp.opId && stillRunning.op.status === 'running', stillRunning.op && stillRunning.op)
+const rightKill = await call({ method: 'kill', opId: scopedOp.opId })
+check('kill with right opId succeeds', rightKill.ok === true, rightKill)
+await new Promise((r) => setTimeout(r, 600))
+const scopedAfterKill = await call({ method: 'op', opId: scopedOp.opId })
+check('right-opId kill settles the op killed', scopedAfterKill.ok && scopedAfterKill.op
+  && scopedAfterKill.op.status === 'killed', scopedAfterKill.op && scopedAfterKill.op)
+
 // busy refusal while an op is still live
 writeFileSync(fakeBin, `setTimeout(() => {}, 60000)\n`)
 const op3 = await call({ method: 'install', source: 'fake:slow2', profile: 'web', binPath: fakeBin, label: 'slow2', skipCheck: true })
@@ -431,6 +579,44 @@ check('loaderNamesFor returns patch row names', Array.isArray(rowNames) && rowNa
 check('loaderNamesFor falls back to package name', mod.loaderNamesFor('web', 'no-such-pkg').length === 1
   && mod.loaderNamesFor('web', 'no-such-pkg')[0] === 'no-such-pkg', mod.loaderNamesFor('web', 'no-such-pkg'))
 
+// --- sweepSnapshots: keep the newest N manifest snapshots, protect package.json ---
+// sweepSnapshots(profile, keep) resolves the dir via profileDir()/dshHome(),
+// which reads DSH_HOME per call (not cached at module load), so the tmp-home
+// env-pin pattern works. Also: apply() already ran a sweep on 'web' at import
+// time under the ORIGINAL DSH_HOME — harmless, that tree doesn't exist here.
+{
+  const snapHome = join(tmpdir(), 'mkts-snap-home-' + process.pid)
+  const snapOrigHome = process.env.DSH_HOME
+  process.env.DSH_HOME = snapHome
+  const sprof = join(snapHome, 'profiles', 'web')
+  mkdirSync(sprof, { recursive: true })
+  const pkgJson = JSON.stringify({ name: 'dsh-profile-web', private: true, dependencies: {} }, null, 2) + '\n'
+  writeFileSync(join(sprof, 'package.json'), pkgJson)
+  // Six snapshots with strictly increasing epoch-ms-like timestamps (the sweep
+  // sorts numerically by the captured group, newest kept).
+  const stamps = [1720000000000, 1720000001000, 1720000002000, 1720000003000, 1720000004000, 1720000005000]
+  for (const ts of stamps) writeFileSync(join(sprof, 'package.json.mkts-snapshot-' + ts + '.json'), pkgJson)
+  // A decoy the filter regex must NOT match (prefix drift / foreign basename).
+  writeFileSync(join(sprof, 'package.json.bak-snapshot-1720000009000.json'), pkgJson)
+  mod.sweepSnapshots('web', 3)
+  const remaining = readdirSync(sprof).filter((f) => /mkts-snapshot-\d+\.json$/.test(f)).sort()
+  check('sweepSnapshots keeps the 3 newest snapshots',
+    remaining.length === 3
+    && remaining.includes('package.json.mkts-snapshot-1720000003000.json')
+    && remaining.includes('package.json.mkts-snapshot-1720000004000.json')
+    && remaining.includes('package.json.mkts-snapshot-1720000005000.json'), remaining)
+  check('sweepSnapshots deletes the 3 oldest snapshots',
+    !existsSync(join(sprof, 'package.json.mkts-snapshot-1720000000000.json'))
+    && !existsSync(join(sprof, 'package.json.mkts-snapshot-1720000001000.json'))
+    && !existsSync(join(sprof, 'package.json.mkts-snapshot-1720000002000.json')), remaining)
+  check('sweepSnapshots never touches package.json or non-snapshot files',
+    readFileSync(join(sprof, 'package.json'), 'utf8') === pkgJson
+    && existsSync(join(sprof, 'package.json.bak-snapshot-1720000009000.json')), readdirSync(sprof))
+  if (snapOrigHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = snapOrigHome
+  try { rmSync(snapHome, { recursive: true, force: true }) } catch {}
+}
+
 if (origHome === undefined) delete process.env.DSH_HOME
 else process.env.DSH_HOME = origHome
 try { rmSync(tmpHome, { recursive: true, force: true }) } catch {}
@@ -519,6 +705,47 @@ const minst = registeredTools.get('market_installed')
 check('market_installed parameters are empty object schema',
   minst.parameters.type === 'object' && Object.keys(minst.parameters.properties).length === 0
   && !minst.parameters.required, minst.parameters)
+
+// market_installed output schema must tolerate null versions: readInstalledVersion
+// returns null whenever node_modules/<name>/package.json is unreadable, so a
+// `string`-only declaration would reject honest rows (also for latestVersion
+// and the self block, which is null unless an update is available).
+{
+  const verNode = minst.output.schema.properties.plugins.items.properties.version
+  const latestNode = minst.output.schema.properties.plugins.items.properties.latestVersion
+  const selfVerNode = minst.output.schema.properties.self.oneOf[0].properties.version
+  check('market_installed plugin.version declares string|null',
+    JSON.stringify(verNode).includes('"type":"null"'), verNode)
+  check('market_installed plugin.latestVersion declares string|null',
+    JSON.stringify(latestNode).includes('"type":"null"'), latestNode)
+  check('market_installed self.version declares string|null',
+    JSON.stringify(selfVerNode).includes('"type":"null"'), selfVerNode)
+  // Execute against a fresh DSH_HOME whose profile declares a link: dep (the
+  // offline-safe short-circuit — checkUpdates skips network for link:/file:)
+  // with NO node_modules: readInstalledVersion must emit version null, and
+  // the returned rows must still satisfy the declared null-tolerant shape.
+  const minstHome = join(tmpdir(), 'mkts-minst-home-' + process.pid)
+  const minstOrigHome = process.env.DSH_HOME
+  process.env.DSH_HOME = minstHome
+  const mprof = join(minstHome, 'profiles', 'web')
+  mkdirSync(mprof, { recursive: true })
+  writeFileSync(join(mprof, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-web', private: true,
+    dependencies: { 'mkts-linked-pkg': 'link:../mkts-linked-pkg' },
+  }, null, 2) + '\n')
+  let executed = null
+  try { executed = await minst.execute({}, { signal: new AbortController().signal, agent: undefined }) } catch {}
+  if (minstOrigHome === undefined) delete process.env.DSH_HOME
+  else process.env.DSH_HOME = minstOrigHome
+  try { rmSync(minstHome, { recursive: true, force: true }) } catch {}
+  if (executed !== null && Array.isArray(executed.plugins) && executed.plugins.length > 0) {
+    const row = executed.plugins.find((p) => p.name === 'mkts-linked-pkg')
+    check('market_installed emits null version without node_modules',
+      row !== undefined && row.version === null && row.latestVersion === null, executed.plugins)
+  }
+  // (An execute throw or empty rows is tolerated offline: the schema shape
+  // assertions above are the load-bearing part.)
+}
 
 // Output schemas stay inside the host's supported JSON Schema subset and the
 // background-capable tools declare the background/completed oneOf union.

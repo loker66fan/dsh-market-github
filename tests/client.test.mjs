@@ -1,4 +1,4 @@
-// Client smoke for dsh-webui-market-plugin-plus: load lib/client.js through a
+// Client smoke for dsh-market-github: load lib/client.js through a
 // fake __ModuleLoader__ + react stub, verify the module shape (bundle id =
 // package name), that apply() registers BOTH the settings.plugins.tab (market)
 // and the shell.overlay (global progress) seats, and that the enable/disable
@@ -24,14 +24,24 @@ globalThis.document = {
 }
 Object.defineProperty(globalThis, 'navigator', { value: { language: 'zh-CN' }, configurable: true })
 // resumeOp() calls fetch('/api/dsh-market'...) safely — stub a no-op so no real
-// request leaves the test.
-globalThis.fetch = (() => new Promise((res) => res({ json: () => Promise.resolve({ ok: true, op: null }) })))
+// request leaves the test. apiOp reads the body via r.text() then JSON.parses,
+// so the stub provides both shapes.
+const body = JSON.stringify({ ok: true, op: null })
+globalThis.fetch = (() => new Promise((res) => res({
+  ok: true, status: 200,
+  text: () => Promise.resolve(body),
+  json: () => Promise.resolve({ ok: true, op: null }),
+})))
 // location used by apply-side terminal reload; stub minimally.
 globalThis.location = { reload: () => {} }
 
 const src = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+// react-dom is a platform-module external: the stub answers it with a minimal
+// createPortal (components render into the stubbed document tree in tests).
+const ReactDOM = { createPortal: (tree) => tree }
 const require = (spec) => {
   if (spec === 'react' || spec === 'react/jsx-runtime') return React
+  if (spec === 'react-dom') return ReactDOM
   throw new Error('unexpected require: ' + spec)
 }
 const factory = new Function('require', src + '\n;return typeof module !== "undefined" ? module.exports : undefined')
@@ -73,6 +83,11 @@ check('tab label localized', tab && typeof tab.reg.opts.label === 'function' && 
 check('tab component is function', tab && typeof tab.reg.Component === 'function')
 check('registers shell.overlay (global progress)', !!overlay)
 check('overlay component is function', overlay && typeof overlay.reg.Component === 'function')
+
+// Bundle-text regressions: the sort active class must stay mkts-prefixed, and
+// killCurrentOp must tolerate the server's "no running op" reply.
+check('sort on-class is mkts-prefixed', /\.mkts-sort button\.mkts-on\{/.test(src) && !/\.mkts-sort button\.on\{/.test(src))
+check('kill tolerates no-running-op reply', src.includes('没有正在运行'))
 
 // --- enable/disable active-state matching (new in fork) ---
 // Extract the pure matchers from the bundle source (production code, not a
